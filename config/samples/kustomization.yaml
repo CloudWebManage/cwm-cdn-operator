@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- cdn_v1_cdntenant.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

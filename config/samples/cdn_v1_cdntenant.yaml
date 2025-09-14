@@ -1,0 +1,62 @@
+apiVersion: cdn.cloudwm-cdn.com/v1
+kind: CdnTenant
+metadata:
+  labels:
+    app.kubernetes.io/name: cwm-cdn-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: cdntenant-sample
+spec:
+  origins:
+    - url: http://example.com
+  domains:
+    - name: test.example.com
+      # self-signed certificate for testing purposes only
+      cert: |
+        -----BEGIN CERTIFICATE-----
+        MIIDCTCCAfGgAwIBAgIUPFGJ+u6JN7GxVmVZ56SRh++KVLEwDQYJKoZIhvcNAQEL
+        BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI1MDkxMjA3NDI0MVoXDTI2MDkx
+        MjA3NDI0MVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+        AAOCAQ8AMIIBCgKCAQEAokYL2EvibVHSZAKx6sMRmbc/ksBP2vQYpW5KRkrF/5/F
+        xenZ2XG3xa6hIu67CvC/1+jY36csgoyyKCFsn4LHhYymb/m2rK+zPtlf5x3f0qIe
+        lTkKdbTZxYHSrGf2bfk79I07k9PfkiYFHu0X2hxIjdBrGSiFkjOPVPji7WWrVoAx
+        1kTQvq6aDnj/VdRrgq+/pBPQTYGjnPBPc11qtCrEE/RB3gipKRQE3ju8mv5aR5Lc
+        ck/YqeSO99ro7C8aMOkUWHF76+AXfqbDpR+DTFHABeSg6ZoCoU8vYrUuDSYu2GGx
+        jlrwk3NQkaKXoqLHskEWCo4a0wnnmuneZ2IHMSC6GQIDAQABo1MwUTAdBgNVHQ4E
+        FgQUruc/9g+l4yJ+sMIIav9eZlZjUlowHwYDVR0jBBgwFoAUruc/9g+l4yJ+sMII
+        av9eZlZjUlowDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAPNDi
+        sIYqXTfQt9kXtYvinyzyBpnQn9U9h9Mr8Jy1tLWcwXUHg384qL0rI+pV0WHt7R2s
+        bmB5zZfcFnuRCS22tnWRSXEv0uQClFnasqrKEPmr1EYwVuOp1yTmNVb1Wg19rNDx
+        6g7GwtdhQrSUScTQm0xyf1ckFsB4W7v1unOuwsPrgwsFuyCU4kxtPf16BILYirLq
+        yJmcSjTqF/VPKBuHeQ0oOhmTLgrq4dANlwyZXD3wdptfR2anLLCS4YD5VX2xZtof
+        lsFm7KevbAAjFwo8XEhjP47s3DgZG6OBySg0gKiVi4svn83J01dSqp6CCV6TYiyw
+        L9VlMeaiiMN1KmxyDg==
+        -----END CERTIFICATE-----
+      key: |
+        -----BEGIN PRIVATE KEY-----
+        MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCiRgvYS+JtUdJk
+        ArHqwxGZtz+SwE/a9BilbkpGSsX/n8XF6dnZcbfFrqEi7rsK8L/X6NjfpyyCjLIo
+        IWyfgseFjKZv+basr7M+2V/nHd/Soh6VOQp1tNnFgdKsZ/Zt+Tv0jTuT09+SJgUe
+        7RfaHEiN0GsZKIWSM49U+OLtZatWgDHWRNC+rpoOeP9V1GuCr7+kE9BNgaOc8E9z
+        XWq0KsQT9EHeCKkpFATeO7ya/lpHktxyT9ip5I732ujsLxow6RRYcXvr4Bd+psOl
+        H4NMUcAF5KDpmgKhTy9itS4NJi7YYbGOWvCTc1CRopeioseyQRYKjhrTCeea6d5n
+        YgcxILoZAgMBAAECggEAMUehaD3fVQCgqoORAXDdAvf+A/SIK7+uTmr4fnFNwOwF
+        9S0n3dulihCW2dNzFQb407pgRkdwAnN01TAVWzmtmvaUQvQsUDQJdMAx2i+d3csj
+        C4EnlohmDA95aacm1M34MbPEUIfq4OjP7EznTfMB66NMKvc93SDwWcc9rweNqXZI
+        AMZ/tqY20OxKBClczX4lvuzU3TXF9PgrUYVJDq+jc+rYj3QofuIhBcM2+hx5nnMO
+        ELO8GhwSeYHbgn0NK/GSGmzQVCc/nzQo7jJ6jc1DYgyPbv5ATqpkbM2uClzURFB+
+        rKXbtuaOWZe/VUQvWv1xz7LQ9FVipHlrOEWOmTbOywKBgQDVMhazWcyFA3FbShKG
+        BtKwjSAc8k/qjGnr1pPy33ewwR/nPc3+/u3LnSIv1OPfpAnOEa5LvOI+Ll5bn7K/
+        zIdTnEtBQ6sPM+oW22tozw5F3/nWcWDYAZS50K0E1QIZmja0FsjzXk0WkUX/Sxde
+        U8uACF2UF7YEAENvwda3/7ccWwKBgQDC2qWxb3uhle7PZNVM3qSvYJisiDL2Rmlh
+        SCfNWviE+kqqW6LO6bFUHpRmBU+2/3670JwjR60Pe2l9PDhW6AjyudXJ96Ikp6Jg
+        G9VESHbrTcKWt0EuumweJykmQP+kKjo08tH+5U6ZcNaf4RxpS8W6x/vysWSwJg4q
+        3TrNp9jdmwKBgQCFuTQ57OJ2sBEjFJQH0zHGIc75uRddZBNwJRiJp5d4m7o6Hi8e
+        eaKIK5hs7hi8hzTLN5Xe1awHGqh+ye2hllVvoUImvp4GHCcBjUGS7QTj2TfpRRZc
+        hqlV38kWldEKZAtZ7EzBMe4icJ66IcyXkvG67gRcRn8ZhVzHNYtLwC6HrwKBgA68
+        9P1nvkUpjweWy99lk7VELCgYoSophzz5dTE+KT/9onoiNj1KRcRkD7truWzRBGf2
+        TmkIudlK716umGBSaqLZVYdSOKxnFYwJbuccSApiNk6qC78aEKVzNtSS5AMpwn9Q
+        wntyIrDObR1orHp2Zb1L9Q2VR1Vfe4DYfOMjR+7zAoGARJZvgvLlxw924lmVh7rE
+        nxALdMKkfYDwUBXJrDZTRPJXidgkn2er9arDtpbscUfT4RK7buUPUZZ45NXIyRZJ
+        WOqYnkzOH4wbgNFxDl9vErNroJBTKsQpDhSw9b3KevZiJBB+9LKyD3PoB2d797iy
+        1uIOoOkEwmVkebOxiuWa+js=
+        -----END PRIVATE KEY-----
