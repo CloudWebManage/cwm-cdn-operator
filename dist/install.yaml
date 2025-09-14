@@ -540,7 +540,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: ghcr.io/cloudwebmanage/cwm-cdn-operator:latest
+        image: ghcr.io/cloudwebmanage/cwm-cdn-operator:6426c3b4915a976dadb866349ca0a051a5f85acd
         imagePullPolicy: Always
         livenessProbe:
           httpGet:
