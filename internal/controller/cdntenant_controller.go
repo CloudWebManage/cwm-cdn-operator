@@ -167,6 +167,10 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			deployment.Spec.Template.Labels["app"] = "tenant"
 			deployment.Spec.Replicas = ptr.To(int32(1))
 			ps := &deployment.Spec.Template.Spec
+			tolerations := []corev1.Toleration{{Key: "cwm-iac-worker-role", Operator: corev1.TolerationOpEqual, Value: "cdn", Effect: corev1.TaintEffectNoExecute}}
+			if !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.Tolerations, tolerations) {
+				ps.Tolerations = tolerations
+			}
 			if len(ps.Containers) == 0 {
 				ps.Containers = []corev1.Container{
 					{
