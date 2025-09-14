@@ -201,6 +201,10 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 					Name:  "ORIGIN_URL",
 					Value: tenant.Spec.Origins[0].Url,
 				},
+				{
+					Name:  "TENANT_NAME",
+					Value: tenant.Name,
+				},
 			}
 			if !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.Containers[0].Env, env) {
 				c.Env = env

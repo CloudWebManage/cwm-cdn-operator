@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: ghcr.io/cloudwebmanage/cwm-cdn-operator
-  newTag: adf562286addde947351e2cc088bf9d7bbc3dc2f
+  newTag: 55cc88370c9e25e84c9978b8535610a1b1587d20
