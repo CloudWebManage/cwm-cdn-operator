@@ -25,7 +25,7 @@ jobs:
           make docker-build docker-push build-installer
 
       - name: upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: cwm-cdn-operator-installer
           path: dist
