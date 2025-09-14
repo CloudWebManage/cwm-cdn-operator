@@ -6,19 +6,14 @@ on:
       - main
 
 jobs:
-  test:
+  ci:
     name: Run on Ubuntu
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
         uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Running Tests
+      - name: build and push
         env:
           IMG: ghcr.io/cloudwebmanage/cwm-cdn-operator:${GITHUB_SHA}
         run: |
