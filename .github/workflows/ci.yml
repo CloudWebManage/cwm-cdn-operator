@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Running Tests
+        env:
+          IMG: ghcr.io/cloudwebmanage/cwm-cdn-operator:${GITHUB_SHA}
+        run: |
+          make docker-build docker-push build-installer
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: cwm-cdn-operator-installer
+          path: dist
