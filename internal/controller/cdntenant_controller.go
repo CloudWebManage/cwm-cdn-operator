@@ -235,6 +235,12 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			service.Spec.Selector["app"] = "tenant"
 			ports := []corev1.ServicePort{
 				{
+					Name:       "http",
+					Protocol:   corev1.ProtocolTCP,
+					Port:       80,
+					TargetPort: intstr.IntOrString{Type: intstr.Int, IntVal: 80},
+				},
+				{
 					Name:       "https",
 					Protocol:   corev1.ProtocolTCP,
 					Port:       443,
