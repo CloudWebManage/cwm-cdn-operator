@@ -22,11 +22,16 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: build and push
         env:
-          IMG: ghcr.io/cloudwebmanage/cwm-cdn-operator:${GITHUB_SHA}
+          IMAGE: ghcr.io/cloudwebmanage/cwm-cdn-operator/operator
+          GITHUB_SHA: ${{ github.sha }}
         run: |
-          make docker-build docker-push build-installer &&\
-          git config --global user.name "cwm-cdn-operator" &&\
-          git config --global user.email "cwm-cdn-operator@localhost" &&\
-          git add dist &&\
-          git commit -m "Add dist" &&\
-          git push origin HEAD:main
+          IMG="${IMAGE}:${GITHUB_SHA}" make docker-build docker-push build-installer &&\
+          docker tag "$IMG" "${IMAGE}:latest" &&\
+          docker push "${IMAGE}:latest" &&\
+          if ! git diff --quiet -- dist; then
+            git config --global user.name "cwm-cdn-operator" &&\
+            git config --global user.email "cwm-cdn-operator@localhost" &&\
+            git add dist &&\
+            git commit -m "update dist" &&\
+            git push origin HEAD:main
+          fi
