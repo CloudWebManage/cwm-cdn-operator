@@ -1,10 +1,13 @@
 name: CI
-
 on:
   push:
     branches:
       - main
-
+    paths-ignore:
+      - dist/**
+permissions:
+  contents: write
+  packages: write
 jobs:
   ci:
     name: Run on Ubuntu
@@ -21,9 +24,9 @@ jobs:
         env:
           IMG: ghcr.io/cloudwebmanage/cwm-cdn-operator:${GITHUB_SHA}
         run: |
-          make docker-build docker-push build-installer
-      - name: upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cwm-cdn-operator-installer
-          path: dist
+          make docker-build docker-push build-installer &&\
+          git config --global user.name "cwm-cdn-operator" &&\
+          git config --global user.email "cwm-cdn-operator@localhost" &&\
+          git add dist &&\
+          git commit -m "Add dist" &&\
+          git push origin HEAD:main
