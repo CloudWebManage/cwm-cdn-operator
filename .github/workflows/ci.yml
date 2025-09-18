@@ -8,6 +8,8 @@ on:
 permissions:
   contents: write
   packages: write
+env:
+  IMAGE: ghcr.io/cloudwebmanage/cwm-cdn-operator/operator
 jobs:
   ci:
     name: Run on Ubuntu
@@ -20,15 +22,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: build and push
-        env:
-          IMAGE: ghcr.io/cloudwebmanage/cwm-cdn-operator/operator
-          GITHUB_SHA: ${{ github.sha }}
+      - uses: docker/setup-buildx-action@v3
+      - id: docker_build
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-latest
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-latest,mode=max
+      - name: update dist
         run: |
-          export IMG="${IMAGE}:${GITHUB_SHA}" &&\
-          make docker-build docker-push build-installer &&\
-          docker tag "$IMG" "${IMAGE}:latest" &&\
-          docker push "${IMAGE}:latest" &&\
+          make build-installer &&\
           if ! git diff --quiet -- dist; then
             git config --global user.name "cwm-cdn-operator" &&\
             git config --global user.email "cwm-cdn-operator@localhost" &&\
