@@ -17,9 +17,11 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	cdnv1 "github.com/CloudWebManage/cwm-cdn-operator/api/v1"
+	"io"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -29,21 +31,29 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
+	"net/http"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"strconv"
 	"strings"
+	"time"
 )
 
 const (
-	typeAvailableTenant = "Available"
-	tenantFinalizer     = "cdn.cloudwm-cdn.com/finalizer"
-	tenantAnnotationKey = "cdn.cloudwm-cdn.com/tenant"
+	typeAvailableTenant      = "Available"
+	tenantFinalizer          = "cdn.cloudwm-cdn.com/finalizer"
+	tenantAnnotationKey      = "cdn.cloudwm-cdn.com/tenant"
+	configAnnotationKey      = "cdn.cloudwm-cdn.com/config"
+	configAnnotationValue    = "true"
+	configSecretName         = "cwm-cdn-tenants-config"
+	secondariesAnnotationKey = "cdn.cloudwm-cdn.com/secondaries-"
 )
 
 // CdnTenantReconciler reconciles a CdnTenant object
@@ -77,6 +87,15 @@ func (r *CdnTenantReconciler) setReconcilingConditionError(ctx context.Context, 
 		return ctrl.Result{}, e
 	} else {
 		return ctrl.Result{}, err
+	}
+}
+
+func (r *CdnTenantReconciler) setReconcilingConditionRequeue(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, message string, requeueAfter time.Duration) (ctrl.Result, error) {
+	logf.FromContext(ctx).Info(message)
+	if e := r.setReconcilingCondition(ctx, req, tenant, message); e != nil {
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	} else {
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 }
 
@@ -263,6 +282,13 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			hasUpdates = true
 			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", fmt.Sprintf("Service %s", opres))
 		}
+		hasUpdates, requeueAfter, err := r.syncSecondaries(req, ctx, tenant, hasUpdates)
+		if err != nil {
+			return r.setReconcilingConditionError(ctx, req, tenant, err, "Failed to sync updates to secondaries")
+		}
+		if requeueAfter > 0 {
+			return r.setReconcilingConditionRequeue(ctx, req, tenant, "Failed to sync secondaries, will retry", requeueAfter)
+		}
 		if hasUpdates {
 			meta.SetStatusCondition(&tenant.Status.Conditions, metav1.Condition{
 				Type:    typeAvailableTenant,
@@ -289,6 +315,13 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		err := r.Delete(ctx, namespace)
 		if err != nil && !apierrors.IsNotFound(err) {
 			return r.setReconcilingConditionError(ctx, req, tenant, err, "Failed to delete Namespace")
+		}
+		_, requeueAfter, err := r.syncSecondaries(req, ctx, tenant, true)
+		if err != nil {
+			return r.setReconcilingConditionError(ctx, req, tenant, err, "Failed to sync delete to secondaries")
+		}
+		if requeueAfter > 0 {
+			return r.setReconcilingConditionRequeue(ctx, req, tenant, "Failed to sync secondaries, will retry", requeueAfter)
 		}
 		if controllerutil.ContainsFinalizer(tenant, tenantFinalizer) {
 			controllerutil.RemoveFinalizer(tenant, tenantFinalizer)
@@ -323,9 +356,179 @@ func (r *CdnTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}}
 		},
 	)
+	configH := handler.EnqueueRequestsFromMapFunc(
+		func(ctx context.Context, obj client.Object) []reconcile.Request {
+			if obj.GetAnnotations()[configAnnotationKey] != configAnnotationValue {
+				return nil
+			}
+			if obj.GetName() != configSecretName {
+				return nil
+			}
+			var list cdnv1.CdnTenantList
+			if err := r.List(ctx, &list); err != nil {
+				return nil
+			}
+			var reqs []reconcile.Request
+			for _, t := range list.Items {
+				if obj.GetNamespace() == t.Namespace {
+					reqs = append(reqs, reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Namespace: t.Namespace,
+							Name:      t.Name,
+						},
+					})
+				}
+			}
+			return reqs
+		},
+	)
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cdnv1.CdnTenant{}).
 		Watches(&appsv1.Deployment{}, h).
 		Watches(&corev1.Service{}, h).
+		Watches(&corev1.Secret{}, configH).
 		Complete(r)
+}
+
+func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Context, tenant *cdnv1.CdnTenant, hasUpdates bool) (bool, time.Duration, error) {
+	var secret corev1.Secret
+	forceSync := hasUpdates
+	if err := r.Get(ctx, types.NamespacedName{Name: configSecretName, Namespace: tenant.Namespace}, &secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return hasUpdates, 0, nil
+		} else {
+			return hasUpdates, 0, err
+		}
+	} else {
+		secondariesJSON, ok := secret.Data["secondaries.json"]
+		if !ok {
+			return hasUpdates, 0, nil
+		} else {
+			var secondaries map[string]map[string]string
+			if err = json.Unmarshal(secondariesJSON, &secondaries); err != nil {
+				return hasUpdates, 0, err
+			}
+			updateTenantAnnotations := false
+			requeueAfter := time.Duration(0)
+			for name, secondaryConfig := range secondaries {
+				syncStatus, ok := tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)]
+				if !ok {
+					syncStatus = ""
+				}
+				if (forceSync && syncStatus != "synced") || (!forceSync && syncStatus == "syncing") {
+					logf.FromContext(ctx).Info(
+						"Syncing secondary",
+						"secondary", name,
+						"tenant", tenant.Name,
+						"syncStatus", syncStatus,
+						"forceSync", forceSync,
+					)
+					hasUpdates = true
+					if syncStatus == "" {
+						tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)] = "syncing"
+						updateTenantAnnotations = true
+					}
+					requeue, err := r.syncSecondary(ctx, tenant, name, secondaryConfig)
+					if err != nil {
+						return hasUpdates, 0, err
+					}
+					if requeue {
+						retryNum, ok := tenant.Annotations[fmt.Sprintf("%s-%s-retry", secondariesAnnotationKey, name)]
+						if !ok {
+							retryNum = "0"
+						}
+						retryNumInt, err := strconv.Atoi(retryNum)
+						if err != nil {
+							retryNumInt = 0
+						}
+						if retryNumInt < 10 {
+							retryNumInt += 1
+							updateTenantAnnotations = true
+							tenant.Annotations[fmt.Sprintf("%s-%s-retry", secondariesAnnotationKey, name)] = fmt.Sprintf("%d", retryNumInt)
+						}
+						newRequeueAfter := time.Duration(retryNumInt*retryNumInt*2) * time.Second
+						if newRequeueAfter > requeueAfter {
+							requeueAfter = newRequeueAfter
+						}
+					} else {
+						tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)] = "synced"
+						updateTenantAnnotations = true
+					}
+				}
+			}
+			if updateTenantAnnotations {
+				if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
+					logf.FromContext(ctx).Error(err, "Failed to re-fetch tenant")
+					return hasUpdates, 0, err
+				}
+				if err = r.Update(ctx, tenant); err != nil {
+					return hasUpdates, 0, err
+				}
+			}
+			if requeueAfter > 0 {
+				return hasUpdates, requeueAfter, nil
+			} else {
+				for name, _ := range secondaries {
+					tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)] = ""
+				}
+				if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
+					logf.FromContext(ctx).Error(err, "Failed to re-fetch tenant")
+					return hasUpdates, 0, err
+				}
+				if err = r.Update(ctx, tenant); err != nil {
+					return hasUpdates, 0, err
+				}
+				return hasUpdates, 0, nil
+			}
+		}
+	}
+}
+
+func (r *CdnTenantReconciler) syncSecondary(ctx context.Context, tenant *cdnv1.CdnTenant, name string, config map[string]string) (bool, error) {
+	action := "delete"
+	var body io.Reader
+	if tenant.DeletionTimestamp.IsZero() {
+		action = "apply"
+		b, err := json.Marshal(tenant.Spec)
+		if err != nil {
+			return false, err
+		}
+		body = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		fmt.Sprintf("%s/%s?cdn_tenant_name=%s", config["url"], action, tenant.Name),
+		body,
+	)
+	if err != nil {
+		return false, err
+	}
+	req.SetBasicAuth(config["user"], config["pass"])
+	if action == "apply" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	c := &http.Client{Timeout: 10 * time.Second}
+	//dump, _ := httputil.DumpRequestOut(req, true)
+	//log.Println(string(dump))
+	resp, err := c.Do(req)
+	if err != nil {
+		logf.FromContext(ctx).Error(
+			err,
+			fmt.Sprintf("Failed to call %s for secondary, will retry", action),
+			"secondary", name, "tenant", tenant.Name,
+		)
+		return true, nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		slurp, _ := io.ReadAll(resp.Body)
+		logf.FromContext(ctx).Error(
+			fmt.Errorf("Unexpected %s status: %s\n%s", action, resp.Status, string(slurp)),
+			fmt.Sprintf("Failed to call %s for secondary, will retry", action),
+			"secondary", name, "tenant", tenant.Name,
+		)
+		return true, nil
+	}
+	return false, nil
 }
