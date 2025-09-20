@@ -106,6 +106,7 @@ func (r *CdnTenantReconciler) setReconcilingConditionRequeue(ctx context.Context
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -400,6 +401,11 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 			return hasUpdates, 0, err
 		}
 	} else {
+		primaryKeyBytes, ok := secret.Data["primaryKey"]
+		if !ok {
+			primaryKeyBytes = []byte("")
+		}
+		primaryKey := string(primaryKeyBytes)
 		secondariesJSON, ok := secret.Data["secondaries.json"]
 		if !ok {
 			return hasUpdates, 0, nil
@@ -428,7 +434,7 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 						tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)] = "syncing"
 						updateTenantAnnotations = true
 					}
-					requeue, err := r.syncSecondary(ctx, tenant, name, secondaryConfig)
+					requeue, err := r.syncSecondary(ctx, tenant, name, secondaryConfig, primaryKey)
 					if err != nil {
 						return hasUpdates, 0, err
 					}
@@ -484,21 +490,34 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 	}
 }
 
-func (r *CdnTenantReconciler) syncSecondary(ctx context.Context, tenant *cdnv1.CdnTenant, name string, config map[string]string) (bool, error) {
+func (r *CdnTenantReconciler) syncSecondary(ctx context.Context, tenant *cdnv1.CdnTenant, name string, config map[string]string, primaryKey string) (bool, error) {
 	action := "delete"
 	var body io.Reader
 	if tenant.DeletionTimestamp.IsZero() {
 		action = "apply"
+		m := make(map[string]interface{})
 		b, err := json.Marshal(tenant.Spec)
+		if err != nil {
+			return false, err
+		}
+		if err := json.Unmarshal(b, &m); err != nil {
+			return false, err
+		}
+		m["primaryKey"] = primaryKey
+		b, err = json.Marshal(m)
 		if err != nil {
 			return false, err
 		}
 		body = bytes.NewReader(b)
 	}
+	url := fmt.Sprintf("%s/%s?cdn_tenant_name=%s", config["url"], action, tenant.Name)
+	if action == "delete" {
+		url += "&primary_key=" + primaryKey
+	}
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		fmt.Sprintf("%s/%s?cdn_tenant_name=%s", config["url"], action, tenant.Name),
+		url,
 		body,
 	)
 	if err != nil {
