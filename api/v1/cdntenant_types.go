@@ -32,11 +32,15 @@ type Domain struct {
 
 	// +required
 	Key string `json:"key,omitempty"`
+
+	Config map[string]string `json:"config,omitempty"`
 }
 
 type Origin struct {
 	// +required
 	Url string `json:"url"`
+
+	Config map[string]string `json:"config,omitempty"`
 }
 
 // CdnTenantSpec defines the desired state of CdnTenant
@@ -53,6 +57,8 @@ type CdnTenantSpec struct {
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=1
 	Domains []Domain `json:"domains"`
+
+	Config map[string]string `json:"config,omitempty"`
 }
 
 // CdnTenantStatus defines the observed state of CdnTenant.

@@ -20,8 +20,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	cdnv1 "github.com/CloudWebManage/cwm-cdn-operator/api/v1"
 	"io"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	cdnv1 "github.com/CloudWebManage/cwm-cdn-operator/api/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -34,16 +40,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
-	"net/http"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"strconv"
-	"strings"
-	"time"
 )
 
 const (
@@ -54,6 +56,9 @@ const (
 	configAnnotationValue    = "true"
 	configSecretName         = "cwm-cdn-tenants-config"
 	secondariesAnnotationKey = "cdn.cloudwm-cdn.com/secondaries-"
+	configEnvVarPrefix       = "CWM_CDN_TENANT_DEFAULT_"
+	defaultImage             = "ghcr.io/cloudwebmanage/cwm-cdn-api-tenant-nginx:latest"
+	defaultReplicas          = 1
 )
 
 // CdnTenantReconciler reconciles a CdnTenant object
@@ -97,6 +102,29 @@ func (r *CdnTenantReconciler) setReconcilingConditionRequeue(ctx context.Context
 	} else {
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
+}
+
+func (r *CdnTenantReconciler) getTenantSpecConfig(tenant *cdnv1.CdnTenant, configKey string, defaultValue string) string {
+	value, ok := tenant.Spec.Config[configKey]
+	if !ok || value == "" {
+		value = os.Getenv(fmt.Sprintf("%s%s", configEnvVarPrefix, configKey))
+		if value == "" {
+			value = defaultValue
+		}
+	}
+	return value
+}
+
+func (r *CdnTenantReconciler) getTenantSpecConfigInt(tenant *cdnv1.CdnTenant, configKey string, defaultValue int) int {
+	value := r.getTenantSpecConfig(tenant, configKey, "")
+	if value == "" {
+		return defaultValue
+	}
+	valueInt, err := strconv.Atoi(value)
+	if err != nil {
+		return defaultValue
+	}
+	return valueInt
 }
 
 // +kubebuilder:rbac:groups=cdn.cloudwm-cdn.com,resources=cdntenants,verbs=get;list;watch;create;update;patch;delete
@@ -185,7 +213,7 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				deployment.Spec.Template.Labels = map[string]string{}
 			}
 			deployment.Spec.Template.Labels["app"] = "tenant"
-			deployment.Spec.Replicas = ptr.To(int32(1))
+			deployment.Spec.Replicas = ptr.To(int32(r.getTenantSpecConfigInt(tenant, "REPLICAS", defaultReplicas)))
 			ps := &deployment.Spec.Template.Spec
 			tolerations := []corev1.Toleration{{Key: "cwm-iac-worker-role", Operator: corev1.TolerationOpEqual, Value: "cdn", Effect: corev1.TaintEffectNoExecute}}
 			if !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.Tolerations, tolerations) {
@@ -199,7 +227,7 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				}
 			}
 			c := &ps.Containers[0]
-			c.Image = "ghcr.io/cloudwebmanage/cwm-cdn-api-tenant-nginx:latest"
+			c.Image = r.getTenantSpecConfig(tenant, "IMAGE", defaultImage)
 			ports := []corev1.ContainerPort{
 				{
 					ContainerPort: 443,
@@ -210,21 +238,49 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			}
 			env := []corev1.EnvVar{
 				{
-					Name:  "CERT",
-					Value: tenant.Spec.Domains[0].Cert,
-				},
-				{
-					Name:  "KEY",
-					Value: tenant.Spec.Domains[0].Key,
-				},
-				{
-					Name:  "ORIGIN_URL",
-					Value: tenant.Spec.Origins[0].Url,
-				},
-				{
 					Name:  "TENANT_NAME",
 					Value: tenant.Name,
 				},
+			}
+			for i, domain := range tenant.Spec.Domains {
+				env = append(env, corev1.EnvVar{
+					Name:  fmt.Sprintf("D%d_NAME", i),
+					Value: domain.Name,
+				})
+				env = append(env, corev1.EnvVar{
+					Name:  fmt.Sprintf("D%d_CERT", i),
+					Value: domain.Cert,
+				})
+				env = append(env, corev1.EnvVar{
+					Name:  fmt.Sprintf("D%d_KEY", i),
+					Value: domain.Key,
+				})
+				for k, v := range tenant.Spec.Domains[i].Config {
+					env = append(env, corev1.EnvVar{
+						Name:  fmt.Sprintf("D%d_%s", i, strings.ToUpper(k)),
+						Value: v,
+					})
+				}
+			}
+			for i, origin := range tenant.Spec.Origins {
+				env = append(env, corev1.EnvVar{
+					Name:  fmt.Sprintf("O%d_URL", i),
+					Value: origin.Url,
+				})
+				for k, v := range tenant.Spec.Origins[i].Config {
+					env = append(env, corev1.EnvVar{
+						Name:  fmt.Sprintf("O%d_%s", i, strings.ToUpper(k)),
+						Value: v,
+					})
+				}
+			}
+			for k, v := range tenant.Spec.Config {
+				if !strings.Contains("IMAGE,REPLICAS", k) {
+					env = append(env, corev1.EnvVar{
+						Name:  strings.ToUpper(k),
+						Value: v,
+					})
+				}
 			}
 			if !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.Containers[0].Env, env) {
 				c.Env = env

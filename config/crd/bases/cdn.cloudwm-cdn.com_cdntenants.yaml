@@ -39,11 +39,19 @@ spec:
           spec:
             description: spec defines the desired state of CdnTenant
             properties:
+              config:
+                additionalProperties:
+                  type: string
+                type: object
               domains:
                 items:
                   properties:
                     cert:
                       type: string
+                    config:
+                      additionalProperties:
+                        type: string
+                      type: object
                     key:
                       type: string
                     name:
@@ -59,6 +67,10 @@ spec:
               origins:
                 items:
                   properties:
+                    config:
+                      additionalProperties:
+                        type: string
+                      type: object
                     url:
                       type: string
                   required:
