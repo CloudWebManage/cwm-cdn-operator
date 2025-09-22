@@ -4,6 +4,7 @@ on:
     branches:
       - main
     paths-ignore:
+      - .github/workflows/ci-dist.yml
       - dist/**
 permissions:
   contents: write
@@ -40,6 +41,25 @@ jobs:
             ${{ env.IMAGE }}:${{ github.sha }}
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-latest
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-latest,mode=max
+      - name: update cwm-worker-cluster
+        env:
+          DEPLOY_KEY_B64: ${{ secrets.CWM_WORKER_CLUSTER_DEPLOY_KEY_B64 }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          echo $DEPLOY_KEY_B64 | base64 -d > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+          export GIT_SSH_COMMAND="ssh -i /tmp/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@localhost"
+          git clone git@github.com:CloudWebManage/cwm-worker-cluster.git
+          cd cwm-worker-cluster
+          echo 'cwmCdnOperator:
+            operator:
+              image: "'$IMAGE':'${GITHUB_SHA}'"
+          ' > config/auto-updated/cwm-cdn-operator/operator.yaml
+          git add config/auto-updated/cwm-cdn-operator/operator.yaml
+          git commit -m "Update cwm-cdn-operator/operator"
+          git push origin main
       - name: update dist
         run: |
           make build-installer &&\

@@ -1,0 +1,32 @@
+name: CI DIST
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/ci-dist.yml
+      - dist/**
+jobs:
+  ci-dist:
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - name: update cwm-worker-cluster
+        env:
+          DEPLOY_KEY_B64: ${{ secrets.CWM_WORKER_CLUSTER_DEPLOY_KEY_B64 }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          echo $DEPLOY_KEY_B64 | base64 -d > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+          export GIT_SSH_COMMAND="ssh -i /tmp/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@localhost"
+          git clone git@github.com:CloudWebManage/cwm-worker-cluster.git
+          cd cwm-worker-cluster
+          echo 'cwmCdnOperator:
+            dist:
+              hash: "'${GITHUB_SHA}'"
+          ' > config/auto-updated/cwm-cdn-operator/dist.yaml
+          git add config/auto-updated/cwm-cdn-operator/dist.yaml
+          git commit -m "Update cwm-cdn-operator/dist"
+          git push origin main
