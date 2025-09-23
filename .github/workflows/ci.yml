@@ -1,16 +1,12 @@
 name: CI
 on:
   push:
-    branches:
-      - main
     paths-ignore:
       - .github/workflows/ci-dist.yml
       - dist/**
 permissions:
   contents: write
   packages: write
-env:
-  IMAGE: ghcr.io/cloudwebmanage/cwm-cdn-operator/operator
 jobs:
   ci:
     name: Run on Ubuntu
@@ -37,6 +33,7 @@ jobs:
                 image: "__IMAGE__"
           deploy_commit_message: "Update cwm-cdn-operator/operator"
       - name: update dist
+        if: ${{ github.ref == 'refs/heads/main' }}
         run: |
           make build-installer &&\
           if ! git diff --quiet -- dist; then
