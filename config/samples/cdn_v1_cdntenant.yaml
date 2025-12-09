@@ -8,6 +8,13 @@ metadata:
 spec:
   origins:
     - url: http://example.com
+  # Optional: Elasticsearch configuration for sending access logs
+  # elasticsearch:
+  #   enabled: true
+  #   config:
+  #     AUTH: '{"strategy": "basic", "user": "elastic", "password": "123456"}'
+  #     BULK: '{"index": "tenant-logs-%Y.%m.%d"}'
+  #     ENDPOINTS: '["https://elasticsearch.example.com:9200"]'
   domains:
     - name: test.example.com
       # self-signed certificate for testing purposes only

@@ -64,6 +64,21 @@ spec:
                 maxItems: 1
                 minItems: 1
                 type: array
+              elasticsearch:
+                description: Elasticsearch configuration for sending access logs
+                properties:
+                  config:
+                    additionalProperties:
+                      type: string
+                    description: Configuration Options
+                    type: object
+                  enabled:
+                    description: Enable or disable Elasticsearch logging
+                    type: boolean
+                required:
+                - config
+                - enabled
+                type: object
               origins:
                 items:
                   properties:

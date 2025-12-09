@@ -43,6 +43,16 @@ type Origin struct {
 	Config map[string]string `json:"config,omitempty"`
 }
 
+type ElasticsearchConfig struct {
+	// +required
+	// Enable or disable Elasticsearch logging
+	Enabled bool `json:"enabled"`
+
+	// +required
+	// Configuration Options
+	Config map[string]string `json:"config"`
+}
+
 // CdnTenantSpec defines the desired state of CdnTenant
 type CdnTenantSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
@@ -57,6 +67,10 @@ type CdnTenantSpec struct {
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=1
 	Domains []Domain `json:"domains"`
+
+	// +optional
+	// Elasticsearch configuration for sending access logs
+	Elasticsearch *ElasticsearchConfig `json:"elasticsearch,omitempty"`
 
 	Config map[string]string `json:"config,omitempty"`
 }

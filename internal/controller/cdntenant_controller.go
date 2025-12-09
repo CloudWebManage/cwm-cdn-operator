@@ -274,6 +274,22 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 					})
 				}
 			}
+			if tenant.Spec.Elasticsearch != nil && tenant.Spec.Elasticsearch.Enabled {
+				env = append(env, corev1.EnvVar{
+					Name:  "ENABLE_TENANT_ACCESS_LOGS",
+					Value: "true",
+				})
+				env = append(env, corev1.EnvVar{
+					Name:  "ENABLE_ES_SINK",
+					Value: "true",
+				})
+				for k, v := range tenant.Spec.Elasticsearch.Config {
+					env = append(env, corev1.EnvVar{
+						Name:  fmt.Sprintf("ES_%s", strings.ToUpper(k)),
+						Value: v,
+					})
+				}
+			}
 			for k, v := range tenant.Spec.Config {
 				if !strings.Contains("IMAGE,REPLICAS", k) {
 					env = append(env, corev1.EnvVar{
