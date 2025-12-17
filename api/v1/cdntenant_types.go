@@ -20,6 +20,73 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// Condition type constants for CdnTenant status
+const (
+	// TypeReady indicates whether the CdnTenant is fully operational
+	// and all resources (namespace, deployment, service) are ready.
+	TypeReady = "Ready"
+
+	// TypeProgressing indicates that the controller is actively
+	// reconciling the CdnTenant resources.
+	TypeProgressing = "Progressing"
+
+	// TypeDegraded indicates that the CdnTenant is in a degraded state,
+	// meaning some functionality may be impaired but the tenant is still operational.
+	TypeDegraded = "Degraded"
+
+	// TypeSecondariesSynced indicates whether the tenant configuration
+	// has been successfully synchronized to all secondary CDN servers.
+	TypeSecondariesSynced = "SecondariesSynced"
+)
+
+// Condition reason constants for CdnTenant status
+const (
+	// ReasonReconciling indicates the controller is actively reconciling.
+	ReasonReconciling = "Reconciling"
+
+	// ReasonReconcileSuccess indicates reconciliation completed successfully.
+	ReasonReconcileSuccess = "ReconcileSuccess"
+
+	// ReasonReconcileFailed indicates reconciliation failed.
+	ReasonReconcileFailed = "ReconcileFailed"
+
+	// ReasonNamespaceFailed indicates namespace creation/update failed.
+	ReasonNamespaceFailed = "NamespaceFailed"
+
+	// ReasonDeploymentFailed indicates deployment creation/update failed.
+	ReasonDeploymentFailed = "DeploymentFailed"
+
+	// ReasonServiceFailed indicates service creation/update failed.
+	ReasonServiceFailed = "ServiceFailed"
+
+	// ReasonAllResourcesReady indicates all managed resources are ready.
+	ReasonAllResourcesReady = "AllResourcesReady"
+
+	// ReasonResourcesNotReady indicates some managed resources are not ready.
+	ReasonResourcesNotReady = "ResourcesNotReady"
+
+	// ReasonSyncInProgress indicates secondary synchronization is in progress.
+	ReasonSyncInProgress = "SyncInProgress"
+
+	// ReasonSyncSuccess indicates secondary synchronization completed successfully.
+	ReasonSyncSuccess = "SyncSuccess"
+
+	// ReasonSyncFailed indicates secondary synchronization failed.
+	ReasonSyncFailed = "SyncFailed"
+
+	// ReasonNoSecondaries indicates no secondary servers are configured.
+	ReasonNoSecondaries = "NoSecondaries"
+
+	// ReasonPartialFailure indicates some operations succeeded but others failed.
+	ReasonPartialFailure = "PartialFailure"
+
+	// ReasonDeleting indicates the resource is being deleted.
+	ReasonDeleting = "Deleting"
+
+	// ReasonDeploymentNotReady indicates the deployment is not yet ready.
+	ReasonDeploymentNotReady = "DeploymentNotReady"
+)
+
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 

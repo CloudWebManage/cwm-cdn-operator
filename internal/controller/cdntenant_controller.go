@@ -49,7 +49,6 @@ import (
 )
 
 const (
-	typeAvailableTenant      = "Available"
 	tenantFinalizer          = "cdn.cloudwm-cdn.com/finalizer"
 	tenantAnnotationKey      = "cdn.cloudwm-cdn.com/tenant"
 	configAnnotationKey      = "cdn.cloudwm-cdn.com/config"
@@ -68,40 +67,206 @@ type CdnTenantReconciler struct {
 	Recorder record.EventRecorder
 }
 
-func (r *CdnTenantReconciler) setReconcilingCondition(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, message string) error {
-	meta.SetStatusCondition(&tenant.Status.Conditions, metav1.Condition{
-		Type:   typeAvailableTenant,
-		Status: metav1.ConditionFalse, Reason: "Reconciling",
-		Message: message,
-	})
+// setCondition sets a condition on the tenant status and updates it in the API server.
+func (r *CdnTenantReconciler) setCondition(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, conditionType string, status metav1.ConditionStatus, reason, message string) error {
+	// Re-fetch the tenant first to get the latest version
 	if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
 		logf.FromContext(ctx).Error(err, "Failed to re-fetch tenant")
 		return err
 	}
-	err := r.Status().Update(ctx, tenant)
-	if err != nil {
+	meta.SetStatusCondition(&tenant.Status.Conditions, metav1.Condition{
+		Type:               conditionType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: tenant.Generation,
+	})
+	if err := r.Status().Update(ctx, tenant); err != nil {
 		logf.FromContext(ctx).Error(err, "Failed to update Tenant status")
 		return err
 	}
 	return nil
 }
 
-func (r *CdnTenantReconciler) setReconcilingConditionError(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, err error, message string) (ctrl.Result, error) {
-	logf.FromContext(ctx).Error(err, message)
-	if e := r.setReconcilingCondition(ctx, req, tenant, message); e != nil {
-		return ctrl.Result{}, e
-	} else {
-		return ctrl.Result{}, err
+// setConditions sets multiple conditions on the tenant status and updates it in the API server.
+func (r *CdnTenantReconciler) setConditions(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, conditions []metav1.Condition) error {
+	// Re-fetch the tenant first to get the latest version
+	if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to re-fetch tenant")
+		return err
 	}
+	for _, cond := range conditions {
+		cond.ObservedGeneration = tenant.Generation
+		meta.SetStatusCondition(&tenant.Status.Conditions, cond)
+	}
+	if err := r.Status().Update(ctx, tenant); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to update Tenant status")
+		return err
+	}
+	return nil
 }
 
-func (r *CdnTenantReconciler) setReconcilingConditionRequeue(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, message string, requeueAfter time.Duration) (ctrl.Result, error) {
+// setProgressingCondition sets the Progressing condition to indicate reconciliation is in progress.
+func (r *CdnTenantReconciler) setProgressingCondition(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, message string) error {
+	return r.setConditions(ctx, req, tenant, []metav1.Condition{
+		{
+			Type:    cdnv1.TypeProgressing,
+			Status:  metav1.ConditionTrue,
+			Reason:  cdnv1.ReasonReconciling,
+			Message: message,
+		},
+		{
+			Type:    cdnv1.TypeReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  cdnv1.ReasonReconciling,
+			Message: message,
+		},
+	})
+}
+
+// setErrorConditions sets conditions indicating a reconciliation failure.
+func (r *CdnTenantReconciler) setErrorConditions(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, reason, message string) error {
+	return r.setConditions(ctx, req, tenant, []metav1.Condition{
+		{
+			Type:    cdnv1.TypeProgressing,
+			Status:  metav1.ConditionFalse,
+			Reason:  reason,
+			Message: message,
+		},
+		{
+			Type:    cdnv1.TypeReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  reason,
+			Message: message,
+		},
+		{
+			Type:    cdnv1.TypeDegraded,
+			Status:  metav1.ConditionTrue,
+			Reason:  reason,
+			Message: message,
+		},
+	})
+}
+
+// setSuccessConditions sets conditions indicating successful reconciliation.
+func (r *CdnTenantReconciler) setSuccessConditions(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, secondariesSynced bool) error {
+	conditions := []metav1.Condition{
+		{
+			Type:    cdnv1.TypeProgressing,
+			Status:  metav1.ConditionFalse,
+			Reason:  cdnv1.ReasonReconcileSuccess,
+			Message: "Reconciliation completed successfully",
+		},
+		{
+			Type:    cdnv1.TypeReady,
+			Status:  metav1.ConditionTrue,
+			Reason:  cdnv1.ReasonAllResourcesReady,
+			Message: "All resources are ready",
+		},
+		{
+			Type:    cdnv1.TypeDegraded,
+			Status:  metav1.ConditionFalse,
+			Reason:  cdnv1.ReasonReconcileSuccess,
+			Message: "Tenant is fully operational",
+		},
+	}
+
+	if secondariesSynced {
+		conditions = append(conditions, metav1.Condition{
+			Type:    cdnv1.TypeSecondariesSynced,
+			Status:  metav1.ConditionTrue,
+			Reason:  cdnv1.ReasonSyncSuccess,
+			Message: "All secondary CDN servers are synchronized",
+		})
+	}
+
+	return r.setConditions(ctx, req, tenant, conditions)
+}
+
+// setSecondariesSyncingCondition sets conditions indicating secondary sync is in progress.
+func (r *CdnTenantReconciler) setSecondariesSyncingCondition(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, message string) error {
+	return r.setConditions(ctx, req, tenant, []metav1.Condition{
+		{
+			Type:    cdnv1.TypeSecondariesSynced,
+			Status:  metav1.ConditionFalse,
+			Reason:  cdnv1.ReasonSyncInProgress,
+			Message: message,
+		},
+		{
+			Type:    cdnv1.TypeDegraded,
+			Status:  metav1.ConditionTrue,
+			Reason:  cdnv1.ReasonSyncFailed,
+			Message: message,
+		},
+	})
+}
+
+// setDeletingConditions sets conditions indicating the tenant is being deleted.
+func (r *CdnTenantReconciler) setDeletingConditions(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, message string) error {
+	return r.setConditions(ctx, req, tenant, []metav1.Condition{
+		{
+			Type:    cdnv1.TypeProgressing,
+			Status:  metav1.ConditionTrue,
+			Reason:  cdnv1.ReasonDeleting,
+			Message: message,
+		},
+		{
+			Type:    cdnv1.TypeReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  cdnv1.ReasonDeleting,
+			Message: message,
+		},
+	})
+}
+
+// handleReconcileError logs the error and sets error conditions.
+func (r *CdnTenantReconciler) handleReconcileError(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, err error, reason, message string) (ctrl.Result, error) {
+	logf.FromContext(ctx).Error(err, message)
+	if e := r.setErrorConditions(ctx, req, tenant, reason, message); e != nil {
+		return ctrl.Result{}, e
+	}
+	return ctrl.Result{}, err
+}
+
+// handleRequeueWithCondition sets syncing conditions and returns a requeue result.
+func (r *CdnTenantReconciler) handleRequeueWithCondition(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, message string, requeueAfter time.Duration) (ctrl.Result, error) {
 	logf.FromContext(ctx).Info(message)
-	if e := r.setReconcilingCondition(ctx, req, tenant, message); e != nil {
-		return ctrl.Result{RequeueAfter: requeueAfter}, nil
-	} else {
+	if e := r.setSecondariesSyncingCondition(ctx, req, tenant, message); e != nil {
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// setDeploymentNotReadyConditions sets conditions indicating the deployment is not yet ready.
+func (r *CdnTenantReconciler) setDeploymentNotReadyConditions(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, message string) error {
+	return r.setConditions(ctx, req, tenant, []metav1.Condition{
+		{
+			Type:    cdnv1.TypeProgressing,
+			Status:  metav1.ConditionTrue,
+			Reason:  cdnv1.ReasonDeploymentNotReady,
+			Message: message,
+		},
+		{
+			Type:    cdnv1.TypeReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  cdnv1.ReasonDeploymentNotReady,
+			Message: message,
+		},
+		{
+			Type:    cdnv1.TypeDegraded,
+			Status:  metav1.ConditionFalse,
+			Reason:  cdnv1.ReasonDeploymentNotReady,
+			Message: "Waiting for deployment to become ready",
+		},
+	})
+}
+
+// isDeploymentReady checks if a deployment has the desired number of ready replicas.
+func isDeploymentReady(deployment *appsv1.Deployment) bool {
+	if deployment.Spec.Replicas == nil {
+		return deployment.Status.ReadyReplicas > 0
+	}
+	return deployment.Status.ReadyReplicas >= *deployment.Spec.Replicas
 }
 
 func (r *CdnTenantReconciler) getTenantSpecConfig(tenant *cdnv1.CdnTenant, configKey string, defaultValue string) string {
@@ -162,7 +327,7 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		hasUpdates := false
 		if len(tenant.Status.Conditions) == 0 {
 			hasUpdates = true
-			if err = r.setReconcilingCondition(ctx, req, tenant, "Starting reconciliation"); err != nil {
+			if err = r.setProgressingCondition(ctx, req, tenant, "Starting reconciliation"); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -183,7 +348,7 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return nil
 		})
 		if err != nil {
-			return r.setReconcilingConditionError(ctx, req, tenant, err, "Failed to reconcile Namespace")
+			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonNamespaceFailed, "Failed to reconcile Namespace")
 		}
 		if opres != controllerutil.OperationResultNone {
 			hasUpdates = true
@@ -304,7 +469,7 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return nil
 		})
 		if err != nil {
-			return r.setReconcilingConditionError(ctx, req, tenant, err, "Failed to reconcile Deployment")
+			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonDeploymentFailed, "Failed to reconcile Deployment")
 		}
 		if opres != controllerutil.OperationResultNone {
 			hasUpdates = true
@@ -349,37 +514,55 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return nil
 		})
 		if err != nil {
-			return r.setReconcilingConditionError(ctx, req, tenant, err, "Failed to reconcile Service")
+			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonServiceFailed, "Failed to reconcile Service")
 		}
 		if opres != controllerutil.OperationResultNone {
 			hasUpdates = true
 			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", fmt.Sprintf("Service %s", opres))
 		}
-		hasUpdates, requeueAfter, err := r.syncSecondaries(req, ctx, tenant, hasUpdates)
-		if err != nil {
-			return r.setReconcilingConditionError(ctx, req, tenant, err, "Failed to sync updates to secondaries")
+
+		// Check if deployment is ready before proceeding
+		if err := r.Get(ctx, types.NamespacedName{Name: "tenant", Namespace: tenant.Name}, deployment); err != nil {
+			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonDeploymentFailed, "Failed to get Deployment status")
 		}
-		if requeueAfter > 0 {
-			return r.setReconcilingConditionRequeue(ctx, req, tenant, "Failed to sync secondaries, will retry", requeueAfter)
-		}
-		if hasUpdates {
-			meta.SetStatusCondition(&tenant.Status.Conditions, metav1.Condition{
-				Type:    typeAvailableTenant,
-				Status:  metav1.ConditionTrue,
-				Reason:  "Reconciling",
-				Message: fmt.Sprintf("tenant reconciled successfully"),
-			})
-			if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
-				logf.FromContext(ctx).Error(err, "Failed to re-fetch tenant")
+		if !isDeploymentReady(deployment) {
+			message := fmt.Sprintf("Waiting for deployment to be ready (ready: %d, desired: %d)",
+				deployment.Status.ReadyReplicas, *deployment.Spec.Replicas)
+			if err := r.setDeploymentNotReadyConditions(ctx, req, tenant, message); err != nil {
 				return ctrl.Result{}, err
 			}
-			if err := r.Status().Update(ctx, tenant); err != nil {
-				log.Error(err, "Failed to update Tenant status")
+			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", message)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
+		hasUpdates, requeueAfter, err := r.syncSecondaries(req, ctx, tenant, hasUpdates)
+		if err != nil {
+			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonSyncFailed, "Failed to sync updates to secondaries")
+		}
+		if requeueAfter > 0 {
+			return r.handleRequeueWithCondition(ctx, req, tenant, "Failed to sync secondaries, will retry", requeueAfter)
+		}
+
+		// Always set success conditions when reconciliation completes successfully
+		// Check if we need to update (either hasUpdates or Ready condition is not True)
+		if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
+			return ctrl.Result{}, err
+		}
+		readyCondition := meta.FindStatusCondition(tenant.Status.Conditions, cdnv1.TypeReady)
+		needsConditionUpdate := hasUpdates || readyCondition == nil || readyCondition.Status != metav1.ConditionTrue
+
+		if needsConditionUpdate {
+			if err := r.setSuccessConditions(ctx, req, tenant, true); err != nil {
 				return ctrl.Result{}, err
 			}
 			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", "Reconciliation successful")
 		}
 	} else {
+		// Tenant is being deleted
+		if err := r.setDeletingConditions(ctx, req, tenant, "Deleting tenant resources"); err != nil {
+			log.Error(err, "Failed to set deleting conditions")
+		}
+
 		namespace := &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: tenant.Name,
@@ -387,14 +570,14 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 		err := r.Delete(ctx, namespace)
 		if err != nil && !apierrors.IsNotFound(err) {
-			return r.setReconcilingConditionError(ctx, req, tenant, err, "Failed to delete Namespace")
+			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonNamespaceFailed, "Failed to delete Namespace")
 		}
 		_, requeueAfter, err := r.syncSecondaries(req, ctx, tenant, true)
 		if err != nil {
-			return r.setReconcilingConditionError(ctx, req, tenant, err, "Failed to sync delete to secondaries")
+			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonSyncFailed, "Failed to sync delete to secondaries")
 		}
 		if requeueAfter > 0 {
-			return r.setReconcilingConditionRequeue(ctx, req, tenant, "Failed to sync secondaries, will retry", requeueAfter)
+			return r.handleRequeueWithCondition(ctx, req, tenant, "Failed to sync secondaries, will retry", requeueAfter)
 		}
 		if controllerutil.ContainsFinalizer(tenant, tenantFinalizer) {
 			controllerutil.RemoveFinalizer(tenant, tenantFinalizer)
