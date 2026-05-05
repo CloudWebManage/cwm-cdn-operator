@@ -19,6 +19,8 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -535,7 +537,7 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 
-		hasUpdates, requeueAfter, err := r.syncSecondaries(req, ctx, tenant, hasUpdates)
+		requeueAfter, err := r.syncSecondaries(req, ctx, tenant)
 		if err != nil {
 			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonSyncFailed, "Failed to sync updates to secondaries")
 		}
@@ -572,7 +574,7 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if err != nil && !apierrors.IsNotFound(err) {
 			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonNamespaceFailed, "Failed to delete Namespace")
 		}
-		_, requeueAfter, err := r.syncSecondaries(req, ctx, tenant, true)
+		requeueAfter, err := r.syncSecondaries(req, ctx, tenant)
 		if err != nil {
 			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonSyncFailed, "Failed to sync delete to secondaries")
 		}
@@ -646,14 +648,13 @@ func (r *CdnTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Context, tenant *cdnv1.CdnTenant, hasUpdates bool) (bool, time.Duration, error) {
+func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Context, tenant *cdnv1.CdnTenant) (time.Duration, error) {
 	var secret corev1.Secret
-	forceSync := hasUpdates
 	if err := r.Get(ctx, types.NamespacedName{Name: configSecretName, Namespace: tenant.Namespace}, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
-			return hasUpdates, 0, nil
+			return 0, nil
 		} else {
-			return hasUpdates, 0, err
+			return 0, err
 		}
 	} else {
 		primaryKeyBytes, ok := secret.Data["primaryKey"]
@@ -663,35 +664,47 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 		primaryKey := string(primaryKeyBytes)
 		secondariesJSON, ok := secret.Data["secondaries.json"]
 		if !ok {
-			return hasUpdates, 0, nil
+			return 0, nil
 		} else {
 			var secondaries map[string]map[string]string
 			if err = json.Unmarshal(secondariesJSON, &secondaries); err != nil {
-				return hasUpdates, 0, err
+				return 0, err
 			}
 			updateTenantAnnotations := false
 			requeueAfter := time.Duration(0)
+			tenantHash, err := r.getTenantHash(tenant)
+			if err != nil {
+				return 0, err
+			}
 			for name, secondaryConfig := range secondaries {
 				syncStatus, ok := tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)]
 				if !ok {
 					syncStatus = ""
 				}
-				if syncStatus == "" || (forceSync && syncStatus != "synced") || (!forceSync && syncStatus == "syncing") {
+				syncedHash, ok := tenant.Annotations[fmt.Sprintf("%s-%s-hash", secondariesAnnotationKey, name)]
+				if !ok {
+					syncedHash = ""
+				}
+				if syncStatus == "" || syncStatus == "syncing" || syncedHash != tenantHash {
 					logf.FromContext(ctx).Info(
 						"Syncing secondary",
 						"secondary", name,
 						"tenant", tenant.Name,
 						"syncStatus", syncStatus,
-						"forceSync", forceSync,
+						"syncedHash", syncedHash,
+						"tenantHash", tenantHash,
 					)
-					hasUpdates = true
-					if syncStatus == "" {
+					if syncStatus != "syncing" {
 						tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)] = "syncing"
+						updateTenantAnnotations = true
+					}
+					if syncedHash != "" {
+						tenant.Annotations[fmt.Sprintf("%s-%s-hash", secondariesAnnotationKey, name)] = ""
 						updateTenantAnnotations = true
 					}
 					requeue, err := r.syncSecondary(ctx, tenant, name, secondaryConfig, primaryKey)
 					if err != nil {
-						return hasUpdates, 0, err
+						return 0, err
 					}
 					if requeue {
 						retryNum, ok := tenant.Annotations[fmt.Sprintf("%s-%s-retry", secondariesAnnotationKey, name)]
@@ -713,6 +726,7 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 						}
 					} else {
 						tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)] = "synced"
+						tenant.Annotations[fmt.Sprintf("%s-%s-hash", secondariesAnnotationKey, name)] = tenantHash
 						updateTenantAnnotations = true
 					}
 				}
@@ -720,27 +734,13 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 			if updateTenantAnnotations {
 				if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
 					logf.FromContext(ctx).Error(err, "Failed to re-fetch tenant")
-					return hasUpdates, 0, err
+					return 0, err
 				}
 				if err = r.Update(ctx, tenant); err != nil {
-					return hasUpdates, 0, err
+					return 0, err
 				}
 			}
-			if requeueAfter > 0 {
-				return hasUpdates, requeueAfter, nil
-			} else {
-				for name, _ := range secondaries {
-					tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)] = ""
-				}
-				if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
-					logf.FromContext(ctx).Error(err, "Failed to re-fetch tenant")
-					return hasUpdates, 0, err
-				}
-				if err = r.Update(ctx, tenant); err != nil {
-					return hasUpdates, 0, err
-				}
-				return hasUpdates, 0, nil
-			}
+			return requeueAfter, nil
 		}
 	}
 }
@@ -805,4 +805,17 @@ func (r *CdnTenantReconciler) syncSecondary(ctx context.Context, tenant *cdnv1.C
 		return true, nil
 	}
 	return false, nil
+}
+
+func (r *CdnTenantReconciler) getTenantHash(tenant *cdnv1.CdnTenant) (string, error) {
+	if tenant.DeletionTimestamp.IsZero() {
+		b, err := json.Marshal(tenant.Spec)
+		if err != nil {
+			return "", err
+		}
+		h := sha256.Sum256(b)
+		return hex.EncodeToString(h[:]), nil
+	} else {
+		return "deleted", nil
+	}
 }

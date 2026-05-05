@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"log"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -1653,5 +1654,23 @@ var _ = Describe("CdnTenant Controller", func() {
 
 			Expect(deploy.Annotations).To(HaveKeyWithValue("cdn.cloudwm-cdn.com/tenant", "default/"+resourceName))
 		})
+	})
+
+	It("should get tenant hash", func() {
+		controllerReconciler := &CdnTenantReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: &record.FakeRecorder{},
+		}
+
+		hash1, err := controllerReconciler.getTenantHash(&cdnv1.CdnTenant{
+			Spec: cdnv1.CdnTenantSpec{
+				Domains: []cdnv1.Domain{{Name: "example.com", Cert: "cert", Key: "key"}},
+				Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
+			},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		log.Printf("Hash1: %s", hash1)
+		Expect(hash1).To(Equal("d1f647f4a28f265f991c63769448b5d82db1714d8df27f73bc227ea4554e658d"))
 	})
 })
