@@ -676,7 +676,7 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 				if !ok {
 					syncStatus = ""
 				}
-				if (forceSync && syncStatus != "synced") || (!forceSync && syncStatus == "syncing") {
+				if syncStatus == "" || (forceSync && syncStatus != "synced") || (!forceSync && syncStatus == "syncing") {
 					logf.FromContext(ctx).Info(
 						"Syncing secondary",
 						"secondary", name,
