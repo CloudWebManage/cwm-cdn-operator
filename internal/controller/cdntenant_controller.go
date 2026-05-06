@@ -92,6 +92,7 @@ func (r *CdnTenantReconciler) setCondition(ctx context.Context, req ctrl.Request
 
 // setConditions sets multiple conditions on the tenant status and updates it in the API server.
 func (r *CdnTenantReconciler) setConditions(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, conditions []metav1.Condition) error {
+	logf.FromContext(ctx).V(1).Info("Setting conditions", "conditions", conditions)
 	// Re-fetch the tenant first to get the latest version
 	if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
 		logf.FromContext(ctx).Error(err, "Failed to re-fetch tenant")
@@ -328,12 +329,14 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if tenant.DeletionTimestamp.IsZero() {
 		hasUpdates := false
 		if len(tenant.Status.Conditions) == 0 {
+			log.V(1).Info("Setting initial conditions")
 			hasUpdates = true
 			if err = r.setProgressingCondition(ctx, req, tenant, "Starting reconciliation"); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
 		if !controllerutil.ContainsFinalizer(tenant, tenantFinalizer) {
+			log.V(1).Info("Adding finalizer")
 			hasUpdates = true
 			controllerutil.AddFinalizer(tenant, tenantFinalizer)
 			if err := r.Update(ctx, tenant); err != nil {
@@ -356,6 +359,7 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			hasUpdates = true
 			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", fmt.Sprintf("Namespace %s", opres))
 		}
+		log.V(1).Info("Reconciled Namespace", "opres", opres)
 		deployment := &appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "tenant",
@@ -477,6 +481,7 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			hasUpdates = true
 			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", fmt.Sprintf("Deployment %s", opres))
 		}
+		log.V(1).Info("Reconciled Deployment", "opres", opres)
 		service := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "tenant",
@@ -522,7 +527,7 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			hasUpdates = true
 			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", fmt.Sprintf("Service %s", opres))
 		}
-
+		log.V(1).Info("Reconciled Service", "opres", opres)
 		// Check if deployment is ready before proceeding
 		if err := r.Get(ctx, types.NamespacedName{Name: "tenant", Namespace: tenant.Name}, deployment); err != nil {
 			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonDeploymentFailed, "Failed to get Deployment status")
@@ -530,13 +535,14 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if !isDeploymentReady(deployment) {
 			message := fmt.Sprintf("Waiting for deployment to be ready (ready: %d, desired: %d)",
 				deployment.Status.ReadyReplicas, *deployment.Spec.Replicas)
+			log.V(1).Info(message)
 			if err := r.setDeploymentNotReadyConditions(ctx, req, tenant, message); err != nil {
 				return ctrl.Result{}, err
 			}
 			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", message)
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-
+		log.V(1).Info("Deployment is ready")
 		requeueAfter, err := r.syncSecondaries(req, ctx, tenant)
 		if err != nil {
 			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonSyncFailed, "Failed to sync updates to secondaries")
@@ -544,7 +550,7 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if requeueAfter > 0 {
 			return r.handleRequeueWithCondition(ctx, req, tenant, "Failed to sync secondaries, will retry", requeueAfter)
 		}
-
+		log.V(1).Info("Reconciled Secondaries")
 		// Always set success conditions when reconciliation completes successfully
 		// Check if we need to update (either hasUpdates or Ready condition is not True)
 		if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
@@ -552,7 +558,18 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 		readyCondition := meta.FindStatusCondition(tenant.Status.Conditions, cdnv1.TypeReady)
 		needsConditionUpdate := hasUpdates || readyCondition == nil || readyCondition.Status != metav1.ConditionTrue
-
+		log.V(1).Info(
+			"Reconciliation complete",
+			"needsConditionUpdate", needsConditionUpdate,
+			"hasUpdates", hasUpdates,
+			"readyConditionStatus", func() string {
+				if readyCondition == nil {
+					return "nil"
+				} else {
+					return string(readyCondition.Status)
+				}
+			},
+		)
 		if needsConditionUpdate {
 			if err := r.setSuccessConditions(ctx, req, tenant, true); err != nil {
 				return ctrl.Result{}, err
@@ -560,11 +577,10 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", "Reconciliation successful")
 		}
 	} else {
-		// Tenant is being deleted
+		log.V(1).Info("Tenant is being deleted, cleaning up resources")
 		if err := r.setDeletingConditions(ctx, req, tenant, "Deleting tenant resources"); err != nil {
 			log.Error(err, "Failed to set deleting conditions")
 		}
-
 		namespace := &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: tenant.Name,
@@ -574,6 +590,7 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if err != nil && !apierrors.IsNotFound(err) {
 			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonNamespaceFailed, "Failed to delete Namespace")
 		}
+		log.V(1).Info("Namespace deleted")
 		requeueAfter, err := r.syncSecondaries(req, ctx, tenant)
 		if err != nil {
 			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonSyncFailed, "Failed to sync delete to secondaries")
@@ -581,12 +598,14 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if requeueAfter > 0 {
 			return r.handleRequeueWithCondition(ctx, req, tenant, "Failed to sync secondaries, will retry", requeueAfter)
 		}
+		log.V(1).Info("Reconciled Secondaries for deletion")
 		if controllerutil.ContainsFinalizer(tenant, tenantFinalizer) {
 			controllerutil.RemoveFinalizer(tenant, tenantFinalizer)
 			if err := r.Update(ctx, tenant); err != nil {
 				log.Error(err, "Failed to remove finalizer from tenant")
 				return ctrl.Result{}, err
 			}
+			log.V(1).Info("Finalizer removed")
 		}
 		r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", "Tenant deleted")
 	}
@@ -649,11 +668,14 @@ func (r *CdnTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Context, tenant *cdnv1.CdnTenant) (time.Duration, error) {
+	var log = logf.FromContext(ctx)
 	var secret corev1.Secret
 	if err := r.Get(ctx, types.NamespacedName{Name: configSecretName, Namespace: tenant.Namespace}, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
+			log.V(1).Info("Config secret not found")
 			return 0, nil
 		} else {
+			log.V(1).Info("Failed to get config secret")
 			return 0, err
 		}
 	} else {
@@ -664,6 +686,7 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 		primaryKey := string(primaryKeyBytes)
 		secondariesJSON, ok := secret.Data["secondaries.json"]
 		if !ok {
+			log.V(1).Info("Failed to get secondaries config")
 			return 0, nil
 		} else {
 			var secondaries map[string]map[string]string
@@ -685,11 +708,16 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 				if !ok {
 					syncedHash = ""
 				}
+				log.V(1).Info(
+					fmt.Sprintf("Checking secondary sync status (%s)", name),
+					"secondary", name,
+					"syncStatus", syncStatus,
+					"syncedHash", syncedHash,
+					"tenantHash", tenantHash,
+				)
 				if syncStatus == "" || syncStatus == "syncing" || syncedHash != tenantHash {
-					logf.FromContext(ctx).Info(
-						"Syncing secondary",
-						"secondary", name,
-						"tenant", tenant.Name,
+					log.Info(
+						fmt.Sprintf("Syncing secondary (%s)", name),
 						"syncStatus", syncStatus,
 						"syncedHash", syncedHash,
 						"tenantHash", tenantHash,
@@ -702,8 +730,19 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 						tenant.Annotations[fmt.Sprintf("%s-%s-hash", secondariesAnnotationKey, name)] = ""
 						updateTenantAnnotations = true
 					}
+					if updateTenantAnnotations {
+						if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
+							log.Error(err, "Failed to re-fetch tenant")
+							return 0, err
+						}
+						if err = r.Update(ctx, tenant); err != nil {
+							return 0, err
+						}
+					}
+					updateTenantAnnotations = false
 					requeue, err := r.syncSecondary(ctx, tenant, name, secondaryConfig, primaryKey)
 					if err != nil {
+						log.V(1).Info(fmt.Sprintf("Failed to sync secondary (%s)", name))
 						return 0, err
 					}
 					if requeue {
@@ -715,6 +754,7 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 						if err != nil {
 							retryNumInt = 0
 						}
+						log.V(1).Info(fmt.Sprintf("syncSecondary requeue (%s)", name), "retryNum", retryNumInt)
 						if retryNumInt < 10 {
 							retryNumInt += 1
 							updateTenantAnnotations = true
@@ -725,6 +765,7 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 							requeueAfter = newRequeueAfter
 						}
 					} else {
+						log.V(1).Info(fmt.Sprintf("Secondary synced successfully (%s)", name))
 						tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)] = "synced"
 						tenant.Annotations[fmt.Sprintf("%s-%s-hash", secondariesAnnotationKey, name)] = tenantHash
 						updateTenantAnnotations = true
