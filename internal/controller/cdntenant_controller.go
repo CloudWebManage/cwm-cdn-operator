@@ -693,7 +693,7 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 			if err = json.Unmarshal(secondariesJSON, &secondaries); err != nil {
 				return 0, err
 			}
-			updateTenantAnnotations := false
+			updateTenantAnnotations := make(map[string]string)
 			requeueAfter := time.Duration(0)
 			tenantHash, err := r.getTenantHash(tenant)
 			if err != nil {
@@ -723,23 +723,24 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 						"tenantHash", tenantHash,
 					)
 					if syncStatus != "syncing" {
-						tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)] = "syncing"
-						updateTenantAnnotations = true
+						updateTenantAnnotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)] = "syncing"
 					}
 					if syncedHash != "" {
-						tenant.Annotations[fmt.Sprintf("%s-%s-hash", secondariesAnnotationKey, name)] = ""
-						updateTenantAnnotations = true
+						updateTenantAnnotations[fmt.Sprintf("%s-%s-hash", secondariesAnnotationKey, name)] = ""
 					}
-					if updateTenantAnnotations {
+					if len(updateTenantAnnotations) > 0 {
 						if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
 							log.Error(err, "Failed to re-fetch tenant")
 							return 0, err
+						}
+						for k, v := range updateTenantAnnotations {
+							tenant.Annotations[k] = v
 						}
 						if err = r.Update(ctx, tenant); err != nil {
 							return 0, err
 						}
 					}
-					updateTenantAnnotations = false
+					updateTenantAnnotations = make(map[string]string)
 					requeue, err := r.syncSecondary(ctx, tenant, name, secondaryConfig, primaryKey)
 					if err != nil {
 						log.V(1).Info(fmt.Sprintf("Failed to sync secondary (%s)", name))
@@ -757,8 +758,7 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 						log.V(1).Info(fmt.Sprintf("syncSecondary requeue (%s)", name), "retryNum", retryNumInt)
 						if retryNumInt < 10 {
 							retryNumInt += 1
-							updateTenantAnnotations = true
-							tenant.Annotations[fmt.Sprintf("%s-%s-retry", secondariesAnnotationKey, name)] = fmt.Sprintf("%d", retryNumInt)
+							updateTenantAnnotations[fmt.Sprintf("%s-%s-retry", secondariesAnnotationKey, name)] = fmt.Sprintf("%d", retryNumInt)
 						}
 						newRequeueAfter := time.Duration(retryNumInt*retryNumInt*2) * time.Second
 						if newRequeueAfter > requeueAfter {
@@ -766,16 +766,18 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 						}
 					} else {
 						log.V(1).Info(fmt.Sprintf("Secondary synced successfully (%s)", name))
-						tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)] = "synced"
-						tenant.Annotations[fmt.Sprintf("%s-%s-hash", secondariesAnnotationKey, name)] = tenantHash
-						updateTenantAnnotations = true
+						updateTenantAnnotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)] = "synced"
+						updateTenantAnnotations[fmt.Sprintf("%s-%s-hash", secondariesAnnotationKey, name)] = tenantHash
 					}
 				}
 			}
-			if updateTenantAnnotations {
+			if len(updateTenantAnnotations) > 0 {
 				if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
 					logf.FromContext(ctx).Error(err, "Failed to re-fetch tenant")
 					return 0, err
+				}
+				for k, v := range updateTenantAnnotations {
+					tenant.Annotations[k] = v
 				}
 				if err = r.Update(ctx, tenant); err != nil {
 					return 0, err
