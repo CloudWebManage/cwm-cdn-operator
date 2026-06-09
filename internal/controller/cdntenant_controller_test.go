@@ -31,10 +31,19 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	cdnv1 "github.com/CloudWebManage/cwm-cdn-operator/api/v1"
 )
+
+type noMatchDeleteClient struct {
+	client.Client
+}
+
+func (c noMatchDeleteClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	return &meta.NoKindMatchError{GroupKind: scaledObjectGVK.GroupKind(), SearchedVersions: []string{scaledObjectGVK.Version}}
+}
 
 var _ = Describe("CdnTenant Controller", func() {
 	Context("When reconciling a resource", func() {
@@ -803,6 +812,43 @@ var _ = Describe("CdnTenant Controller", func() {
 			Expect(latest.Status.Autoscaling.Enabled).To(BeFalse())
 			Expect(latest.Status.Autoscaling.DesiredReplicas).To(Equal(int32(4)))
 			Expect(latest.Status.Autoscaling.LastMessage).To(ContainSubstring("Autoscaling disabled"))
+		})
+
+		It("should preserve fixed-replica behavior when KEDA API is absent and autoscaling is disabled", func() {
+			const resourceName = "tenant-autoscaling-no-keda-api"
+			typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
+
+			resource := &cdnv1.CdnTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
+				Spec: cdnv1.CdnTenantSpec{
+					Domains: []cdnv1.Domain{{Name: "no-keda-api.example.com", Cert: "cert", Key: "key"}},
+					Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
+					Config:  map[string]string{"REPLICAS": "3"},
+					Autoscaling: &cdnv1.CdnTenantAutoscalingSpec{
+						Enabled: false,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			controllerReconciler := &CdnTenantReconciler{
+				Client:   noMatchDeleteClient{Client: k8sClient},
+				Scheme:   k8sClient.Scheme(),
+				Recorder: &record.FakeRecorder{},
+			}
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			deploy := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: "tenant"}, deploy)).To(Succeed())
+			Expect(deploy.Spec.Replicas).NotTo(BeNil())
+			Expect(*deploy.Spec.Replicas).To(Equal(int32(3)))
+
+			latest := &cdnv1.CdnTenant{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, latest)).To(Succeed())
+			Expect(latest.Status.Autoscaling).NotTo(BeNil())
+			Expect(latest.Status.Autoscaling.Enabled).To(BeFalse())
+			Expect(latest.Status.Autoscaling.DesiredReplicas).To(Equal(int32(3)))
 		})
 
 		It("should reject autoscaling minReplicas greater than maxReplicas", func() {

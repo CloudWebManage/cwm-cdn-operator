@@ -365,11 +365,18 @@ func desiredReplicas(deployment *appsv1.Deployment) int32 {
 	return 1
 }
 
+func scaledObjectMissingOrAPIUnavailable(err error) bool {
+	return apierrors.IsNotFound(err) || meta.IsNoMatchError(err)
+}
+
 func (r *CdnTenantReconciler) reconcileScaledObject(ctx context.Context, tenant *cdnv1.CdnTenant) (controllerutil.OperationResult, error) {
 	if !tenantAutoscalingEnabled(tenant) {
 		scaledObject := newScaledObject(tenant)
 		err := r.Delete(ctx, scaledObject)
-		if apierrors.IsNotFound(err) {
+		if scaledObjectMissingOrAPIUnavailable(err) {
+			if meta.IsNoMatchError(err) {
+				logf.FromContext(ctx).V(1).Info("KEDA ScaledObject API is unavailable while autoscaling is disabled; skipping ScaledObject cleanup")
+			}
 			return controllerutil.OperationResultNone, nil
 		}
 		if err != nil {
@@ -865,12 +872,24 @@ func (r *CdnTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return reqs
 		},
 	)
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&cdnv1.CdnTenant{}).
 		Watches(&appsv1.Deployment{}, h).
 		Watches(&corev1.Service{}, h).
-		Watches(&corev1.Secret{}, configH).
-		Complete(r)
+		Watches(&corev1.Secret{}, configH)
+
+	scaledObject := &unstructured.Unstructured{}
+	scaledObject.SetGroupVersionKind(scaledObjectGVK)
+	if _, err := mgr.GetRESTMapper().RESTMapping(scaledObjectGVK.GroupKind(), scaledObjectGVK.Version); err != nil {
+		if !meta.IsNoMatchError(err) {
+			return err
+		}
+		logf.Log.Info("KEDA ScaledObject API is unavailable during setup; skipping ScaledObject watch")
+	} else {
+		b = b.Watches(scaledObject, h)
+	}
+
+	return b.Complete(r)
 }
 
 func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Context, tenant *cdnv1.CdnTenant) (time.Duration, error) {
