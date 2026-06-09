@@ -85,6 +85,9 @@ const (
 
 	// ReasonDeploymentNotReady indicates the deployment is not yet ready.
 	ReasonDeploymentNotReady = "DeploymentNotReady"
+
+	// ReasonDomainTLSPending indicates one or more domain certificates are not ready.
+	ReasonDomainTLSPending = "DomainTLSPending"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -94,13 +97,33 @@ type Domain struct {
 	// +required
 	Name string `json:"name"`
 
-	// +required
+	// +optional
 	Cert string `json:"cert,omitempty"`
 
-	// +required
+	// +optional
 	Key string `json:"key,omitempty"`
 
+	// +optional
+	TLS *DomainTLS `json:"tls,omitempty"`
+
 	Config map[string]string `json:"config,omitempty"`
+}
+
+type DomainTLS struct {
+	// +kubebuilder:validation:Enum=provided;letsencrypt
+	// +optional
+	Mode string `json:"mode,omitempty"`
+
+	// +kubebuilder:validation:Enum=TLSv1.2;TLSv1.3
+	// +optional
+	MinVersion string `json:"minVersion,omitempty"`
+
+	// +kubebuilder:validation:Enum=TLSv1.2;TLSv1.3
+	// +optional
+	MaxVersion string `json:"maxVersion,omitempty"`
+
+	// +optional
+	RedirectHTTPToHTTPS *bool `json:"redirectHttpToHttps,omitempty"`
 }
 
 type Origin struct {
@@ -132,7 +155,6 @@ type CdnTenantSpec struct {
 	Origins []Origin `json:"origins"`
 
 	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=1
 	Domains []Domain `json:"domains"`
 
 	// +optional
@@ -163,6 +185,26 @@ type CdnTenantStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// +optional
+	DomainTLS []DomainTLSStatus `json:"domainTLS,omitempty"`
+}
+
+type DomainTLSStatus struct {
+	// +required
+	Name string `json:"name"`
+
+	// +required
+	Mode string `json:"mode"`
+
+	// +required
+	Ready bool `json:"ready"`
+
+	// +required
+	Reason string `json:"reason"`
+
+	// +required
+	Message string `json:"message"`
 }
 
 // +kubebuilder:object:root=true

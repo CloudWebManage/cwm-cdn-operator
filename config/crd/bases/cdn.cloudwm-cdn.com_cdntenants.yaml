@@ -56,12 +56,29 @@ spec:
                       type: string
                     name:
                       type: string
+                    tls:
+                      properties:
+                        maxVersion:
+                          enum:
+                          - TLSv1.2
+                          - TLSv1.3
+                          type: string
+                        minVersion:
+                          enum:
+                          - TLSv1.2
+                          - TLSv1.3
+                          type: string
+                        mode:
+                          enum:
+                          - provided
+                          - letsencrypt
+                          type: string
+                        redirectHttpToHttps:
+                          type: boolean
+                      type: object
                   required:
-                  - cert
-                  - key
                   - name
                   type: object
-                maxItems: 1
                 minItems: 1
                 type: array
               elasticsearch:
@@ -170,6 +187,27 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              domainTLS:
+                items:
+                  properties:
+                    message:
+                      type: string
+                    mode:
+                      type: string
+                    name:
+                      type: string
+                    ready:
+                      type: boolean
+                    reason:
+                      type: string
+                  required:
+                  - message
+                  - mode
+                  - name
+                  - ready
+                  - reason
+                  type: object
+                type: array
             type: object
         required:
         - spec

@@ -35,6 +35,23 @@ import (
 )
 
 var _ = Describe("CdnTenant Controller", func() {
+	Context("When deriving domain TLS configuration", func() {
+		It("should default existing domains to provided TLS without redirect", func() {
+			domain := cdnv1.Domain{Name: "test.example.com", Cert: "cert", Key: "key"}
+			Expect(domainTLSMode(domain)).To(Equal("provided"))
+			Expect(domainTLSMinVersion(domain)).To(Equal("TLSv1.2"))
+			Expect(domainTLSMaxVersion(domain)).To(Equal("TLSv1.3"))
+			Expect(domainRedirectHTTPToHTTPS(domain)).To(BeFalse())
+		})
+
+		It("should use stable internal certificate resource names for letsencrypt domains", func() {
+			name := domainCertificateResourceName(0, "customer.example.com")
+			Expect(name).To(Equal(domainCertificateSecretName(0, "customer.example.com")))
+			Expect(name).To(HavePrefix("tenant-domain-0-"))
+			Expect(len(name)).To(BeNumerically("<=", 63))
+		})
+	})
+
 	Context("When reconciling a resource", func() {
 		const resourceName = "tenant1"
 
@@ -220,6 +237,15 @@ var _ = Describe("CdnTenant Controller", func() {
 			degradedCondition := meta.FindStatusCondition(tenant.Status.Conditions, cdnv1.TypeDegraded)
 			Expect(degradedCondition).NotTo(BeNil())
 			Expect(degradedCondition.Status).To(Equal(metav1.ConditionFalse))
+
+			By("Verifying domain TLS status is surfaced without internal resource names")
+			Expect(tenant.Status.DomainTLS).To(ConsistOf(cdnv1.DomainTLSStatus{
+				Name:    "notready.example.com",
+				Mode:    "provided",
+				Ready:   true,
+				Reason:  "ProvidedCertificateConfigured",
+				Message: "Provided certificate and key are configured",
+			}))
 		})
 	})
 
