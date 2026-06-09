@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"log"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -688,6 +689,9 @@ var _ = Describe("CdnTenant Controller", func() {
 						MaxReplicas:           7,
 						TargetClientRpsPerPod: 50,
 						TargetOriginRpsPerPod: 25,
+						ScaleDownStabilization: metav1.Duration{
+							Duration: 2 * time.Minute,
+						},
 					},
 				},
 			}
@@ -723,6 +727,35 @@ var _ = Describe("CdnTenant Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(found).To(BeTrue())
 			Expect(triggers).To(HaveLen(2))
+			clientTrigger, ok := triggers[0].(map[string]interface{})
+			Expect(ok).To(BeTrue())
+			clientMetadata, ok := clientTrigger["metadata"].(map[string]interface{})
+			Expect(ok).To(BeTrue())
+			Expect(clientMetadata).To(HaveKeyWithValue("serverAddress", prometheusServerAddress))
+			Expect(clientMetadata).To(HaveKeyWithValue("metricName", "tenant_client_rps"))
+			Expect(clientMetadata).To(HaveKeyWithValue("query", `sum(rate(nginx_http_requests_total{job="tenant", namespace="tenant-autoscaling-enabled", host!="_"}[2m]))`))
+			Expect(clientMetadata).To(HaveKeyWithValue("threshold", "50"))
+			originTrigger, ok := triggers[1].(map[string]interface{})
+			Expect(ok).To(BeTrue())
+			originMetadata, ok := originTrigger["metadata"].(map[string]interface{})
+			Expect(ok).To(BeTrue())
+			Expect(originMetadata).To(HaveKeyWithValue("metricName", "tenant_origin_rps"))
+			Expect(originMetadata).To(HaveKeyWithValue("query", `sum(rate(nginx_http_requests_total{job="tenant", namespace="tenant-autoscaling-enabled", host="_"}[2m]))`))
+			Expect(originMetadata).To(HaveKeyWithValue("threshold", "25"))
+			stabilizationSeconds, found, err := unstructured.NestedInt64(scaledObject.Object, "spec", "advanced", "horizontalPodAutoscalerConfig", "behavior", "scaleDown", "stabilizationWindowSeconds")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeTrue())
+			Expect(stabilizationSeconds).To(Equal(int64(120)))
+
+			latest := &cdnv1.CdnTenant{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, latest)).To(Succeed())
+			Expect(latest.Status.Autoscaling).NotTo(BeNil())
+			Expect(latest.Status.Autoscaling.Enabled).To(BeTrue())
+			Expect(latest.Status.Autoscaling.MinReplicas).To(Equal(int32(2)))
+			Expect(latest.Status.Autoscaling.MaxReplicas).To(Equal(int32(7)))
+			Expect(latest.Status.Autoscaling.CurrentReplicas).To(Equal(int32(0)))
+			Expect(latest.Status.Autoscaling.DesiredReplicas).To(Equal(kedaReplicas))
+			Expect(latest.Status.Autoscaling.LastMessage).NotTo(BeEmpty())
 		})
 
 		It("should remove ScaledObject and restore fixed replicas when autoscaling is disabled", func() {
@@ -764,6 +797,12 @@ var _ = Describe("CdnTenant Controller", func() {
 			Expect(deploy.Spec.Replicas).NotTo(BeNil())
 			Expect(*deploy.Spec.Replicas).To(Equal(int32(4)))
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: "tenant"}, scaledObject)).To(MatchError(ContainSubstring("not found")))
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, latest)).To(Succeed())
+			Expect(latest.Status.Autoscaling).NotTo(BeNil())
+			Expect(latest.Status.Autoscaling.Enabled).To(BeFalse())
+			Expect(latest.Status.Autoscaling.DesiredReplicas).To(Equal(int32(4)))
+			Expect(latest.Status.Autoscaling.LastMessage).To(ContainSubstring("Autoscaling disabled"))
 		})
 
 		It("should reject autoscaling minReplicas greater than maxReplicas", func() {
