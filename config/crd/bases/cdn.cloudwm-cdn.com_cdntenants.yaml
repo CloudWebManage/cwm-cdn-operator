@@ -76,6 +76,10 @@ spec:
                         redirectHttpToHttps:
                           type: boolean
                       type: object
+                      x-kubernetes-validations:
+                      - message: minVersion cannot be greater than maxVersion
+                        rule: '!(has(self.minVersion) && has(self.maxVersion) && self.minVersion
+                          == ''TLSv1.3'' && self.maxVersion == ''TLSv1.2'')'
                   required:
                   - name
                   type: object

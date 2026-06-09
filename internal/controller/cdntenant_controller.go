@@ -19,10 +19,17 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -62,6 +69,8 @@ const (
 	defaultImage             = "ghcr.io/cloudwebmanage/cwm-cdn-api-tenant-nginx:latest"
 	defaultReplicas          = 1
 	defaultClusterIssuer     = "letsencrypt"
+	http01SolverLabelKey     = "cdn.cloudwm-cdn.com/acme-http01-solver"
+	placeholderCertKey       = "cdn.cloudwm-cdn.com/placeholder-certificate"
 )
 
 // CdnTenantReconciler reconciles a CdnTenant object
@@ -351,6 +360,99 @@ func domainCertificateMountPath(index int) string {
 	return fmt.Sprintf("/certs/letsencrypt/%d", index)
 }
 
+func generatePlaceholderTLSSecretData(domainName string) (map[string][]byte, error) {
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		return nil, err
+	}
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, err
+	}
+	notBefore := time.Now().Add(-1 * time.Hour)
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: domainName,
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	if ip := net.ParseIP(domainName); ip != nil {
+		template.IPAddresses = []net.IP{ip}
+	} else {
+		template.DNSNames = []string{domainName}
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return nil, err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	return map[string][]byte{
+		corev1.TLSCertKey:       certPEM,
+		corev1.TLSPrivateKeyKey: keyPEM,
+	}, nil
+}
+
+func certificateReady(certificate *unstructured.Unstructured) bool {
+	conditions, ok, err := unstructured.NestedSlice(certificate.Object, "status", "conditions")
+	if !ok || err != nil {
+		return false
+	}
+	for _, rawCondition := range conditions {
+		condition, ok := rawCondition.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		conditionType, _, _ := unstructured.NestedString(condition, "type")
+		conditionStatus, _, _ := unstructured.NestedString(condition, "status")
+		if conditionType == "Ready" && conditionStatus == "True" {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *CdnTenantReconciler) ensurePlaceholderTLSSecret(ctx context.Context, tenant *cdnv1.CdnTenant, domain cdnv1.Domain, secretName string) error {
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: tenant.Name}, secret); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		data, err := generatePlaceholderTLSSecretData(domain.Name)
+		if err != nil {
+			return err
+		}
+		placeholder := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: tenant.Name,
+				Annotations: map[string]string{
+					tenantAnnotationKey:          fmt.Sprintf("%s/%s", tenant.Namespace, tenant.Name),
+					"cdn.cloudwm-cdn.com/domain": domain.Name,
+					placeholderCertKey:           "true",
+				},
+				Labels: map[string]string{
+					"cdn.cloudwm-cdn.com/tenant":      tenant.Name,
+					"cdn.cloudwm-cdn.com/domain-hash": domainCertificateHash(domain.Name),
+				},
+			},
+			Type: corev1.SecretTypeTLS,
+			Data: data,
+		}
+		if err := r.Create(ctx, placeholder); err != nil && !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		return nil
+	}
+	return nil
+}
+
 func (r *CdnTenantReconciler) reconcileDomainTLSResources(ctx context.Context, tenant *cdnv1.CdnTenant) ([]cdnv1.DomainTLSStatus, error) {
 	statuses := make([]cdnv1.DomainTLSStatus, 0, len(tenant.Spec.Domains))
 	for i, domain := range tenant.Spec.Domains {
@@ -383,6 +485,7 @@ func (r *CdnTenantReconciler) reconcileDomainTLSResources(ctx context.Context, t
 				}
 				labels["cdn.cloudwm-cdn.com/tenant"] = tenant.Name
 				labels["cdn.cloudwm-cdn.com/domain-hash"] = domainHash
+				labels[http01SolverLabelKey] = "true"
 				certificate.SetLabels(labels)
 				annotations := certificate.GetAnnotations()
 				if annotations == nil {
@@ -414,6 +517,9 @@ func (r *CdnTenantReconciler) reconcileDomainTLSResources(ctx context.Context, t
 				return nil, err
 			}
 			logf.FromContext(ctx).V(1).Info("Reconciled Certificate", "name", certificateName, "namespace", tenant.Name, "opres", opres)
+			if err := r.ensurePlaceholderTLSSecret(ctx, tenant, domain, secretName); err != nil {
+				return nil, err
+			}
 
 			secret := &corev1.Secret{}
 			if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: tenant.Name}, secret); err != nil {
@@ -423,13 +529,13 @@ func (r *CdnTenantReconciler) reconcileDomainTLSResources(ctx context.Context, t
 				} else {
 					return nil, err
 				}
-			} else if len(secret.Data[corev1.TLSCertKey]) > 0 && len(secret.Data[corev1.TLSPrivateKeyKey]) > 0 {
+			} else if certificateReady(certificate) && len(secret.Data[corev1.TLSCertKey]) > 0 && len(secret.Data[corev1.TLSPrivateKeyKey]) > 0 {
 				status.Ready = true
 				status.Reason = "CertificateReady"
-				status.Message = "Let's Encrypt certificate secret is ready"
+				status.Message = "Let's Encrypt certificate is ready"
 			} else {
-				status.Reason = "CertificateSecretIncomplete"
-				status.Message = "Let's Encrypt certificate secret is missing tls.crt or tls.key"
+				status.Reason = "CertificatePending"
+				status.Message = "Waiting for Let's Encrypt HTTP-01 validation to complete"
 			}
 		default:
 			status.Reason = "UnsupportedTLSMode"
@@ -481,7 +587,7 @@ func (r *CdnTenantReconciler) getTenantSpecConfigInt(tenant *cdnv1.CdnTenant, co
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -588,10 +694,13 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			c.Image = r.getTenantSpecConfig(tenant, "IMAGE", defaultImage)
 			ports := []corev1.ContainerPort{
 				{
+					ContainerPort: 80,
+				},
+				{
 					ContainerPort: 443,
 				},
 			}
-			if !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.Containers[0].Ports, c.Ports) {
+			if !equality.Semantic.DeepEqual(c.Ports, ports) {
 				c.Ports = ports
 			}
 			env := []corev1.EnvVar{

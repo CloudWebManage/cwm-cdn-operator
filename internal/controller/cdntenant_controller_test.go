@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -49,6 +50,30 @@ var _ = Describe("CdnTenant Controller", func() {
 			Expect(name).To(Equal(domainCertificateSecretName(0, "customer.example.com")))
 			Expect(name).To(HavePrefix("tenant-domain-0-"))
 			Expect(len(name)).To(BeNumerically("<=", 63))
+		})
+
+		It("should generate usable placeholder TLS secret data", func() {
+			data, err := generatePlaceholderTLSSecretData("customer.example.com")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(data).To(HaveKey(corev1.TLSCertKey))
+			Expect(data).To(HaveKey(corev1.TLSPrivateKeyKey))
+			Expect(string(data[corev1.TLSCertKey])).To(ContainSubstring("BEGIN CERTIFICATE"))
+			Expect(string(data[corev1.TLSPrivateKeyKey])).To(ContainSubstring("BEGIN RSA PRIVATE KEY"))
+		})
+
+		It("should use cert-manager Ready condition for letsencrypt readiness", func() {
+			certificate := &unstructured.Unstructured{Object: map[string]interface{}{
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{"type": "Ready", "status": "False"},
+					},
+				},
+			}}
+			Expect(certificateReady(certificate)).To(BeFalse())
+			certificate.Object["status"].(map[string]interface{})["conditions"] = []interface{}{
+				map[string]interface{}{"type": "Ready", "status": "True"},
+			}
+			Expect(certificateReady(certificate)).To(BeTrue())
 		})
 	})
 
@@ -139,6 +164,10 @@ var _ = Describe("CdnTenant Controller", func() {
 			Expect(deploy.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(deploy.Spec.Template.Spec.Containers[0].Name).To(Equal("nginx"))
 			Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal("test"))
+			Expect(deploy.Spec.Template.Spec.Containers[0].Ports).To(ConsistOf([]corev1.ContainerPort{
+				{ContainerPort: 80, Protocol: corev1.ProtocolTCP},
+				{ContainerPort: 443, Protocol: corev1.ProtocolTCP},
+			}))
 			Expect(deploy.Spec.Template.Spec.Containers[0].Env).To(ConsistOf([]corev1.EnvVar{
 				{Name: "TENANT_NAME", Value: "tenant1"},
 				{Name: "D0_NAME", Value: "test.example.com"},
@@ -1445,10 +1474,12 @@ var _ = Describe("CdnTenant Controller", func() {
 
 			Expect(httpPort).NotTo(BeNil())
 			Expect(httpPort.Port).To(Equal(int32(80)))
+			Expect(httpPort.TargetPort.IntVal).To(Equal(int32(80)))
 			Expect(httpPort.Protocol).To(Equal(corev1.ProtocolTCP))
 
 			Expect(httpsPort).NotTo(BeNil())
 			Expect(httpsPort.Port).To(Equal(int32(443)))
+			Expect(httpsPort.TargetPort.IntVal).To(Equal(int32(443)))
 			Expect(httpsPort.Protocol).To(Equal(corev1.ProtocolTCP))
 		})
 

@@ -109,6 +109,7 @@ type Domain struct {
 	Config map[string]string `json:"config,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!(has(self.minVersion) && has(self.maxVersion) && self.minVersion == 'TLSv1.3' && self.maxVersion == 'TLSv1.2')",message="minVersion cannot be greater than maxVersion"
 type DomainTLS struct {
 	// +kubebuilder:validation:Enum=provided;letsencrypt
 	// +optional
