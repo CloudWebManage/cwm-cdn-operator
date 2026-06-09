@@ -129,9 +129,59 @@ type DomainTLS struct {
 
 type Origin struct {
 	// +required
+	// +kubebuilder:validation:MaxLength=2048
 	Url string `json:"url"`
 
+	// +optional
+	// Name identifies this origin in generated config, logs, and health output.
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name,omitempty"`
+
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	// Weight controls load-balancing preference. Defaults to 1 when omitted.
+	Weight *int32 `json:"weight,omitempty"`
+
+	// +optional
+	HealthCheck *OriginHealthCheck `json:"healthCheck,omitempty"`
+
 	Config map[string]string `json:"config,omitempty"`
+}
+
+type OriginHealthCheck struct {
+	// +optional
+	// Enabled controls active origin health checks. Defaults to true when omitted.
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// +kubebuilder:validation:Pattern=`^/.*`
+	// +kubebuilder:validation:MaxLength=2048
+	// +optional
+	// Path is requested for active origin health checks. Defaults to / when omitted.
+	Path string `json:"path,omitempty"`
+
+	// +kubebuilder:validation:Minimum=100
+	// +kubebuilder:validation:Maximum=599
+	// +optional
+	// ExpectedStatus is the HTTP status considered healthy. Defaults to 200 when omitted.
+	ExpectedStatus *int32 `json:"expectedStatus,omitempty"`
+
+	// +optional
+	// Interval is the active health check interval, e.g. 10s. Defaults to 10s when omitted.
+	Interval string `json:"interval,omitempty"`
+
+	// +optional
+	// Timeout is the active health check timeout, e.g. 2s. Defaults to 2s when omitted.
+	Timeout string `json:"timeout,omitempty"`
+
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	// HealthyThreshold is the consecutive success count required to mark healthy. Defaults to 2 when omitted.
+	HealthyThreshold *int32 `json:"healthyThreshold,omitempty"`
+
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	// UnhealthyThreshold is the consecutive failure count required to mark unhealthy. Defaults to 3 when omitted.
+	UnhealthyThreshold *int32 `json:"unhealthyThreshold,omitempty"`
 }
 
 type ElasticsearchConfig struct {
@@ -152,7 +202,9 @@ type CdnTenantSpec struct {
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
 	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=1
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:XValidation:rule="self.all(o, o.url.matches('^https?://[^/?#]+($|[/?#])'))",message="origin URLs must use http or https scheme and include a host"
+	// +kubebuilder:validation:XValidation:rule="self.size() == 1 || self.all(o, !(o.url.matches('^https?://[^/]+/.+')))",message="path-prefixed origin URLs are not supported with multiple origins"
 	Origins []Origin `json:"origins"`
 
 	// +kubebuilder:validation:MinItems=1
