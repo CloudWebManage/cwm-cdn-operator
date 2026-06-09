@@ -68,7 +68,7 @@ const (
 	configEnvVarPrefix       = "CWM_CDN_TENANT_DEFAULT_"
 	defaultImage             = "ghcr.io/cloudwebmanage/cwm-cdn-api-tenant-nginx:latest"
 	defaultReplicas          = 1
-	defaultClusterIssuer     = "letsencrypt"
+	defaultClusterIssuer     = "cdn-tenant-certs"
 	http01SolverLabelKey     = "cdn.cloudwm-cdn.com/acme-http01-solver"
 	placeholderCertKey       = "cdn.cloudwm-cdn.com/placeholder-certificate"
 )
