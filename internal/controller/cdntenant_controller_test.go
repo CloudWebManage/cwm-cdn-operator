@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"log"
+	"os"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -74,6 +75,32 @@ var _ = Describe("CdnTenant Controller", func() {
 				map[string]interface{}{"type": "Ready", "status": "True"},
 			}
 			Expect(certificateReady(certificate)).To(BeTrue())
+		})
+
+		It("should not issue letsencrypt certificates on secondary clusters", func() {
+			oldValue := os.Getenv(isPrimaryEnvVar)
+			defer os.Setenv(isPrimaryEnvVar, oldValue)
+			Expect(os.Setenv(isPrimaryEnvVar, "false")).To(Succeed())
+
+			controllerReconciler := &CdnTenantReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Recorder: &record.FakeRecorder{},
+			}
+			statuses, err := controllerReconciler.reconcileDomainTLSResources(context.Background(), &cdnv1.CdnTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: "tenant-secondary", Namespace: "default"},
+				Spec: cdnv1.CdnTenantSpec{
+					Domains: []cdnv1.Domain{{
+						Name: "customer.example.com",
+						TLS:  &cdnv1.DomainTLS{Mode: "letsencrypt"},
+					}},
+				},
+			})
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(statuses).To(HaveLen(1))
+			Expect(statuses[0].Ready).To(BeFalse())
+			Expect(statuses[0].Reason).To(Equal("LetsEncryptUnsupportedOnSecondary"))
 		})
 	})
 
@@ -1729,5 +1756,28 @@ var _ = Describe("CdnTenant Controller", func() {
 		Expect(err).NotTo(HaveOccurred())
 		log.Printf("Hash1: %s", hash1)
 		Expect(hash1).To(Equal("d1f647f4a28f265f991c63769448b5d82db1714d8df27f73bc227ea4554e658d"))
+	})
+
+	It("should include propagated certificate data in secondary tenant hash", func() {
+		baseSpec := cdnv1.CdnTenantSpec{
+			Domains: []cdnv1.Domain{{
+				Name: "example.com",
+				TLS:  &cdnv1.DomainTLS{Mode: "provided"},
+				Cert: "cert-1",
+				Key:  "key-1",
+			}},
+			Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
+		}
+		renewedSpec, err := cloneTenantSpec(baseSpec)
+		Expect(err).NotTo(HaveOccurred())
+		renewedSpec.Domains[0].Cert = "cert-2"
+		renewedSpec.Domains[0].Key = "key-2"
+
+		baseHash, err := getTenantSpecHash(baseSpec)
+		Expect(err).NotTo(HaveOccurred())
+		renewedHash, err := getTenantSpecHash(renewedSpec)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(renewedHash).NotTo(Equal(baseHash))
 	})
 })

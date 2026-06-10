@@ -69,8 +69,8 @@ const (
 	defaultImage             = "ghcr.io/cloudwebmanage/cwm-cdn-api-tenant-nginx:latest"
 	defaultReplicas          = 1
 	defaultClusterIssuer     = "cdn-tenant-certs"
-	http01SolverLabelKey     = "cdn.cloudwm-cdn.com/acme-http01-solver"
 	placeholderCertKey       = "cdn.cloudwm-cdn.com/placeholder-certificate"
+	isPrimaryEnvVar          = "CWM_CDN_IS_PRIMARY"
 )
 
 // CdnTenantReconciler reconciles a CdnTenant object
@@ -360,6 +360,11 @@ func domainCertificateMountPath(index int) string {
 	return fmt.Sprintf("/certs/letsencrypt/%d", index)
 }
 
+func isPrimaryCluster() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(isPrimaryEnvVar)))
+	return value == "" || value == "true" || value == "1" || value == "yes"
+}
+
 func generatePlaceholderTLSSecretData(domainName string) (map[string][]byte, error) {
 	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialLimit)
@@ -469,6 +474,11 @@ func (r *CdnTenantReconciler) reconcileDomainTLSResources(ctx context.Context, t
 				status.Message = "Provided TLS mode requires cert and key"
 			}
 		case "letsencrypt":
+			if !isPrimaryCluster() {
+				status.Reason = "LetsEncryptUnsupportedOnSecondary"
+				status.Message = "Secondary clusters only consume primary-issued provided certificates"
+				break
+			}
 			secretName := domainCertificateSecretName(i, domain.Name)
 			certificateName := domainCertificateResourceName(i, domain.Name)
 			domainHash := domainCertificateHash(domain.Name)
@@ -485,7 +495,6 @@ func (r *CdnTenantReconciler) reconcileDomainTLSResources(ctx context.Context, t
 				}
 				labels["cdn.cloudwm-cdn.com/tenant"] = tenant.Name
 				labels["cdn.cloudwm-cdn.com/domain-hash"] = domainHash
-				labels[http01SolverLabelKey] = "true"
 				certificate.SetLabels(labels)
 				annotations := certificate.GetAnnotations()
 				if annotations == nil {
@@ -555,6 +564,64 @@ func (r *CdnTenantReconciler) updateDomainTLSStatus(ctx context.Context, req ctr
 	}
 	tenant.Status.DomainTLS = statuses
 	return r.Status().Update(ctx, tenant)
+}
+
+func cloneTenantSpec(spec cdnv1.CdnTenantSpec) (cdnv1.CdnTenantSpec, error) {
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return cdnv1.CdnTenantSpec{}, err
+	}
+	var cloned cdnv1.CdnTenantSpec
+	if err := json.Unmarshal(b, &cloned); err != nil {
+		return cdnv1.CdnTenantSpec{}, err
+	}
+	return cloned, nil
+}
+
+func (r *CdnTenantReconciler) issuedDomainCertificateData(ctx context.Context, tenant *cdnv1.CdnTenant, index int, domain cdnv1.Domain) ([]byte, []byte, error) {
+	certificate := &unstructured.Unstructured{}
+	certificate.SetAPIVersion("cert-manager.io/v1")
+	certificate.SetKind("Certificate")
+	if err := r.Get(ctx, types.NamespacedName{Name: domainCertificateResourceName(index, domain.Name), Namespace: tenant.Name}, certificate); err != nil {
+		return nil, nil, err
+	}
+	if !certificateReady(certificate) {
+		return nil, nil, fmt.Errorf("certificate for domain %q is not ready", domain.Name)
+	}
+
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: domainCertificateSecretName(index, domain.Name), Namespace: tenant.Name}, secret); err != nil {
+		return nil, nil, err
+	}
+	cert := secret.Data[corev1.TLSCertKey]
+	key := secret.Data[corev1.TLSPrivateKeyKey]
+	if len(cert) == 0 || len(key) == 0 {
+		return nil, nil, fmt.Errorf("issued TLS secret for domain %q is missing certificate or key data", domain.Name)
+	}
+	return cert, key, nil
+}
+
+func (r *CdnTenantReconciler) secondaryTenantSpec(ctx context.Context, tenant *cdnv1.CdnTenant) (cdnv1.CdnTenantSpec, error) {
+	spec, err := cloneTenantSpec(tenant.Spec)
+	if err != nil {
+		return cdnv1.CdnTenantSpec{}, err
+	}
+	for i, domain := range tenant.Spec.Domains {
+		if domainTLSMode(domain) != "letsencrypt" {
+			continue
+		}
+		cert, key, err := r.issuedDomainCertificateData(ctx, tenant, i, domain)
+		if err != nil {
+			return cdnv1.CdnTenantSpec{}, err
+		}
+		spec.Domains[i].Cert = string(cert)
+		spec.Domains[i].Key = string(key)
+		if spec.Domains[i].TLS == nil {
+			spec.Domains[i].TLS = &cdnv1.DomainTLS{}
+		}
+		spec.Domains[i].TLS.Mode = "provided"
+	}
+	return spec, nil
 }
 
 func (r *CdnTenantReconciler) getTenantSpecConfig(tenant *cdnv1.CdnTenant, configKey string, defaultValue string) string {
@@ -902,14 +969,6 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		log.V(1).Info("Deployment is ready")
-		requeueAfter, err := r.syncSecondaries(req, ctx, tenant)
-		if err != nil {
-			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonSyncFailed, "Failed to sync updates to secondaries")
-		}
-		if requeueAfter > 0 {
-			return r.handleRequeueWithCondition(ctx, req, tenant, "Failed to sync secondaries, will retry", requeueAfter)
-		}
-		log.V(1).Info("Reconciled Secondaries")
 		if !allDomainTLSReady(domainTLSStatuses) {
 			message := "Waiting for one or more domain TLS certificates to become ready"
 			if err := r.setDomainTLSPendingConditions(ctx, req, tenant, message); err != nil {
@@ -918,6 +977,14 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", message)
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
+		requeueAfter, err := r.syncSecondaries(req, ctx, tenant)
+		if err != nil {
+			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonSyncFailed, "Failed to sync updates to secondaries")
+		}
+		if requeueAfter > 0 {
+			return r.handleRequeueWithCondition(ctx, req, tenant, "Failed to sync secondaries, will retry", requeueAfter)
+		}
+		log.V(1).Info("Reconciled Secondaries")
 		// Always set success conditions when reconciliation completes successfully
 		// Check if we need to update (either hasUpdates or Ready condition is not True)
 		if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
@@ -1063,9 +1130,18 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 			}
 			updateTenantAnnotations := make(map[string]string)
 			requeueAfter := time.Duration(0)
-			tenantHash, err := r.getTenantHash(tenant)
-			if err != nil {
-				return 0, err
+			var secondarySpec *cdnv1.CdnTenantSpec
+			tenantHash := "deleted"
+			if tenant.DeletionTimestamp.IsZero() {
+				spec, err := r.secondaryTenantSpec(ctx, tenant)
+				if err != nil {
+					return 0, err
+				}
+				secondarySpec = &spec
+				tenantHash, err = getTenantSpecHash(spec)
+				if err != nil {
+					return 0, err
+				}
 			}
 			for name, secondaryConfig := range secondaries {
 				syncStatus, ok := tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)]
@@ -1101,6 +1177,9 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 							log.Error(err, "Failed to re-fetch tenant")
 							return 0, err
 						}
+						if tenant.Annotations == nil {
+							tenant.Annotations = map[string]string{}
+						}
 						for k, v := range updateTenantAnnotations {
 							tenant.Annotations[k] = v
 						}
@@ -1109,7 +1188,7 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 						}
 					}
 					updateTenantAnnotations = make(map[string]string)
-					requeue, err := r.syncSecondary(ctx, tenant, name, secondaryConfig, primaryKey)
+					requeue, err := r.syncSecondary(ctx, tenant, secondarySpec, name, secondaryConfig, primaryKey)
 					if err != nil {
 						log.V(1).Info(fmt.Sprintf("Failed to sync secondary (%s)", name))
 						return 0, err
@@ -1144,6 +1223,9 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 					logf.FromContext(ctx).Error(err, "Failed to re-fetch tenant")
 					return 0, err
 				}
+				if tenant.Annotations == nil {
+					tenant.Annotations = map[string]string{}
+				}
 				for k, v := range updateTenantAnnotations {
 					tenant.Annotations[k] = v
 				}
@@ -1156,13 +1238,13 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 	}
 }
 
-func (r *CdnTenantReconciler) syncSecondary(ctx context.Context, tenant *cdnv1.CdnTenant, name string, config map[string]string, primaryKey string) (bool, error) {
+func (r *CdnTenantReconciler) syncSecondary(ctx context.Context, tenant *cdnv1.CdnTenant, secondarySpec *cdnv1.CdnTenantSpec, name string, config map[string]string, primaryKey string) (bool, error) {
 	action := "delete"
 	var body io.Reader
 	if tenant.DeletionTimestamp.IsZero() {
 		action = "apply"
 		m := make(map[string]interface{})
-		b, err := json.Marshal(tenant.Spec)
+		b, err := json.Marshal(secondarySpec)
 		if err != nil {
 			return false, err
 		}
@@ -1220,13 +1302,17 @@ func (r *CdnTenantReconciler) syncSecondary(ctx context.Context, tenant *cdnv1.C
 
 func (r *CdnTenantReconciler) getTenantHash(tenant *cdnv1.CdnTenant) (string, error) {
 	if tenant.DeletionTimestamp.IsZero() {
-		b, err := json.Marshal(tenant.Spec)
-		if err != nil {
-			return "", err
-		}
-		h := sha256.Sum256(b)
-		return hex.EncodeToString(h[:]), nil
+		return getTenantSpecHash(tenant.Spec)
 	} else {
 		return "deleted", nil
 	}
+}
+
+func getTenantSpecHash(spec cdnv1.CdnTenantSpec) (string, error) {
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:]), nil
 }
