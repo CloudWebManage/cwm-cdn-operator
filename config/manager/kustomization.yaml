@@ -4,5 +4,5 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 images:
 - name: controller
-  newName: ghcr.io/cloudwebmanage/cwm-cdn-operator
-  newTag: c9feab5532f912a4a2e67429f4d7071bbe895cb0
+  newName: ghcr.io/cloudwebmanage/cwm-cdn-operator/operator
+  newTag: latest

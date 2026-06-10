@@ -19,10 +19,17 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -36,6 +43,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -60,6 +68,9 @@ const (
 	configEnvVarPrefix       = "CWM_CDN_TENANT_DEFAULT_"
 	defaultImage             = "ghcr.io/cloudwebmanage/cwm-cdn-api-tenant-nginx:latest"
 	defaultReplicas          = 1
+	defaultClusterIssuer     = "cdn-tenant-certs"
+	placeholderCertKey       = "cdn.cloudwm-cdn.com/placeholder-certificate"
+	isPrimaryEnvVar          = "CWM_CDN_IS_PRIMARY"
 )
 
 // CdnTenantReconciler reconciles a CdnTenant object
@@ -264,12 +275,353 @@ func (r *CdnTenantReconciler) setDeploymentNotReadyConditions(ctx context.Contex
 	})
 }
 
+func (r *CdnTenantReconciler) setDomainTLSPendingConditions(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, message string) error {
+	return r.setConditions(ctx, req, tenant, []metav1.Condition{
+		{
+			Type:    cdnv1.TypeProgressing,
+			Status:  metav1.ConditionTrue,
+			Reason:  cdnv1.ReasonDomainTLSPending,
+			Message: message,
+		},
+		{
+			Type:    cdnv1.TypeReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  cdnv1.ReasonDomainTLSPending,
+			Message: message,
+		},
+		{
+			Type:    cdnv1.TypeDegraded,
+			Status:  metav1.ConditionFalse,
+			Reason:  cdnv1.ReasonDomainTLSPending,
+			Message: "Waiting for domain TLS certificates to become ready",
+		},
+	})
+}
+
+func allDomainTLSReady(statuses []cdnv1.DomainTLSStatus) bool {
+	for _, status := range statuses {
+		if !status.Ready {
+			return false
+		}
+	}
+	return true
+}
+
 // isDeploymentReady checks if a deployment has the desired number of ready replicas.
 func isDeploymentReady(deployment *appsv1.Deployment) bool {
 	if deployment.Spec.Replicas == nil {
 		return deployment.Status.ReadyReplicas > 0
 	}
 	return deployment.Status.ReadyReplicas >= *deployment.Spec.Replicas
+}
+
+func domainTLSMode(domain cdnv1.Domain) string {
+	if domain.TLS == nil || domain.TLS.Mode == "" {
+		return "provided"
+	}
+	return domain.TLS.Mode
+}
+
+func domainTLSMinVersion(domain cdnv1.Domain) string {
+	if domain.TLS == nil || domain.TLS.MinVersion == "" {
+		return "TLSv1.2"
+	}
+	return domain.TLS.MinVersion
+}
+
+func domainTLSMaxVersion(domain cdnv1.Domain) string {
+	if domain.TLS == nil || domain.TLS.MaxVersion == "" {
+		return "TLSv1.3"
+	}
+	return domain.TLS.MaxVersion
+}
+
+func domainRedirectHTTPToHTTPS(domain cdnv1.Domain) bool {
+	if domain.TLS == nil || domain.TLS.RedirectHTTPToHTTPS == nil {
+		return false
+	}
+	return *domain.TLS.RedirectHTTPToHTTPS
+}
+
+func domainCertificateResourceName(index int, domainName string) string {
+	return fmt.Sprintf("tenant-domain-%d-%s", index, domainCertificateHash(domainName))
+}
+
+func domainCertificateHash(domainName string) string {
+	domainHash := sha256.Sum256([]byte(domainName))
+	return hex.EncodeToString(domainHash[:])[:12]
+}
+
+func domainCertificateSecretName(index int, domainName string) string {
+	return domainCertificateResourceName(index, domainName)
+}
+
+func domainCertificateMountPath(index int) string {
+	return fmt.Sprintf("/certs/letsencrypt/%d", index)
+}
+
+func isPrimaryCluster() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(isPrimaryEnvVar)))
+	return value == "" || value == "true" || value == "1" || value == "yes"
+}
+
+func generatePlaceholderTLSSecretData(domainName string) (map[string][]byte, error) {
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		return nil, err
+	}
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, err
+	}
+	notBefore := time.Now().Add(-1 * time.Hour)
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: domainName,
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	if ip := net.ParseIP(domainName); ip != nil {
+		template.IPAddresses = []net.IP{ip}
+	} else {
+		template.DNSNames = []string{domainName}
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return nil, err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	return map[string][]byte{
+		corev1.TLSCertKey:       certPEM,
+		corev1.TLSPrivateKeyKey: keyPEM,
+	}, nil
+}
+
+func certificateReady(certificate *unstructured.Unstructured) bool {
+	conditions, ok, err := unstructured.NestedSlice(certificate.Object, "status", "conditions")
+	if !ok || err != nil {
+		return false
+	}
+	for _, rawCondition := range conditions {
+		condition, ok := rawCondition.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		conditionType, _, _ := unstructured.NestedString(condition, "type")
+		conditionStatus, _, _ := unstructured.NestedString(condition, "status")
+		if conditionType == "Ready" && conditionStatus == "True" {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *CdnTenantReconciler) ensurePlaceholderTLSSecret(ctx context.Context, tenant *cdnv1.CdnTenant, domain cdnv1.Domain, secretName string) error {
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: tenant.Name}, secret); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		data, err := generatePlaceholderTLSSecretData(domain.Name)
+		if err != nil {
+			return err
+		}
+		placeholder := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: tenant.Name,
+				Annotations: map[string]string{
+					tenantAnnotationKey:          fmt.Sprintf("%s/%s", tenant.Namespace, tenant.Name),
+					"cdn.cloudwm-cdn.com/domain": domain.Name,
+					placeholderCertKey:           "true",
+				},
+				Labels: map[string]string{
+					"cdn.cloudwm-cdn.com/tenant":      tenant.Name,
+					"cdn.cloudwm-cdn.com/domain-hash": domainCertificateHash(domain.Name),
+				},
+			},
+			Type: corev1.SecretTypeTLS,
+			Data: data,
+		}
+		if err := r.Create(ctx, placeholder); err != nil && !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		return nil
+	}
+	return nil
+}
+
+func (r *CdnTenantReconciler) reconcileDomainTLSResources(ctx context.Context, tenant *cdnv1.CdnTenant) ([]cdnv1.DomainTLSStatus, error) {
+	statuses := make([]cdnv1.DomainTLSStatus, 0, len(tenant.Spec.Domains))
+	for i, domain := range tenant.Spec.Domains {
+		mode := domainTLSMode(domain)
+		status := cdnv1.DomainTLSStatus{Name: domain.Name, Mode: mode}
+		switch mode {
+		case "provided":
+			if domain.Cert != "" && domain.Key != "" {
+				status.Ready = true
+				status.Reason = "ProvidedCertificateConfigured"
+				status.Message = "Provided certificate and key are configured"
+			} else {
+				status.Reason = "ProvidedCertificateMissing"
+				status.Message = "Provided TLS mode requires cert and key"
+			}
+		case "letsencrypt":
+			if !isPrimaryCluster() {
+				status.Reason = "LetsEncryptUnsupportedOnSecondary"
+				status.Message = "Secondary clusters only consume primary-issued provided certificates"
+				break
+			}
+			secretName := domainCertificateSecretName(i, domain.Name)
+			certificateName := domainCertificateResourceName(i, domain.Name)
+			domainHash := domainCertificateHash(domain.Name)
+			tenantReference := fmt.Sprintf("%s/%s", tenant.Namespace, tenant.Name)
+			certificate := &unstructured.Unstructured{}
+			certificate.SetAPIVersion("cert-manager.io/v1")
+			certificate.SetKind("Certificate")
+			certificate.SetName(certificateName)
+			certificate.SetNamespace(tenant.Name)
+			opres, err := controllerutil.CreateOrUpdate(ctx, r.Client, certificate, func() error {
+				labels := certificate.GetLabels()
+				if labels == nil {
+					labels = map[string]string{}
+				}
+				labels["cdn.cloudwm-cdn.com/tenant"] = tenant.Name
+				labels["cdn.cloudwm-cdn.com/domain-hash"] = domainHash
+				certificate.SetLabels(labels)
+				annotations := certificate.GetAnnotations()
+				if annotations == nil {
+					annotations = map[string]string{}
+				}
+				annotations["cdn.cloudwm-cdn.com/domain"] = domain.Name
+				certificate.SetAnnotations(annotations)
+				unstructured.SetNestedMap(certificate.Object, map[string]interface{}{
+					"secretName": secretName,
+					"dnsNames":   []interface{}{domain.Name},
+					"issuerRef": map[string]interface{}{
+						"name": defaultClusterIssuer,
+						"kind": "ClusterIssuer",
+					},
+					"secretTemplate": map[string]interface{}{
+						"annotations": map[string]interface{}{
+							tenantAnnotationKey:          tenantReference,
+							"cdn.cloudwm-cdn.com/domain": domain.Name,
+						},
+						"labels": map[string]interface{}{
+							"cdn.cloudwm-cdn.com/tenant":      tenant.Name,
+							"cdn.cloudwm-cdn.com/domain-hash": domainHash,
+						},
+					},
+				}, "spec")
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			logf.FromContext(ctx).V(1).Info("Reconciled Certificate", "name", certificateName, "namespace", tenant.Name, "opres", opres)
+			if err := r.ensurePlaceholderTLSSecret(ctx, tenant, domain, secretName); err != nil {
+				return nil, err
+			}
+
+			secret := &corev1.Secret{}
+			if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: tenant.Name}, secret); err != nil {
+				if apierrors.IsNotFound(err) {
+					status.Reason = "CertificatePending"
+					status.Message = "Waiting for Let's Encrypt HTTP-01 validation to issue the TLS secret"
+				} else {
+					return nil, err
+				}
+			} else if certificateReady(certificate) && len(secret.Data[corev1.TLSCertKey]) > 0 && len(secret.Data[corev1.TLSPrivateKeyKey]) > 0 {
+				status.Ready = true
+				status.Reason = "CertificateReady"
+				status.Message = "Let's Encrypt certificate is ready"
+			} else {
+				status.Reason = "CertificatePending"
+				status.Message = "Waiting for Let's Encrypt HTTP-01 validation to complete"
+			}
+		default:
+			status.Reason = "UnsupportedTLSMode"
+			status.Message = fmt.Sprintf("Unsupported TLS mode %q", mode)
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses, nil
+}
+
+func (r *CdnTenantReconciler) updateDomainTLSStatus(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, statuses []cdnv1.DomainTLSStatus) error {
+	if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
+		return err
+	}
+	if equality.Semantic.DeepEqual(tenant.Status.DomainTLS, statuses) {
+		return nil
+	}
+	tenant.Status.DomainTLS = statuses
+	return r.Status().Update(ctx, tenant)
+}
+
+func cloneTenantSpec(spec cdnv1.CdnTenantSpec) (cdnv1.CdnTenantSpec, error) {
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return cdnv1.CdnTenantSpec{}, err
+	}
+	var cloned cdnv1.CdnTenantSpec
+	if err := json.Unmarshal(b, &cloned); err != nil {
+		return cdnv1.CdnTenantSpec{}, err
+	}
+	return cloned, nil
+}
+
+func (r *CdnTenantReconciler) issuedDomainCertificateData(ctx context.Context, tenant *cdnv1.CdnTenant, index int, domain cdnv1.Domain) ([]byte, []byte, error) {
+	certificate := &unstructured.Unstructured{}
+	certificate.SetAPIVersion("cert-manager.io/v1")
+	certificate.SetKind("Certificate")
+	if err := r.Get(ctx, types.NamespacedName{Name: domainCertificateResourceName(index, domain.Name), Namespace: tenant.Name}, certificate); err != nil {
+		return nil, nil, err
+	}
+	if !certificateReady(certificate) {
+		return nil, nil, fmt.Errorf("certificate for domain %q is not ready", domain.Name)
+	}
+
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: domainCertificateSecretName(index, domain.Name), Namespace: tenant.Name}, secret); err != nil {
+		return nil, nil, err
+	}
+	cert := secret.Data[corev1.TLSCertKey]
+	key := secret.Data[corev1.TLSPrivateKeyKey]
+	if len(cert) == 0 || len(key) == 0 {
+		return nil, nil, fmt.Errorf("issued TLS secret for domain %q is missing certificate or key data", domain.Name)
+	}
+	return cert, key, nil
+}
+
+func (r *CdnTenantReconciler) secondaryTenantSpec(ctx context.Context, tenant *cdnv1.CdnTenant) (cdnv1.CdnTenantSpec, error) {
+	spec, err := cloneTenantSpec(tenant.Spec)
+	if err != nil {
+		return cdnv1.CdnTenantSpec{}, err
+	}
+	for i, domain := range tenant.Spec.Domains {
+		if domainTLSMode(domain) != "letsencrypt" {
+			continue
+		}
+		cert, key, err := r.issuedDomainCertificateData(ctx, tenant, i, domain)
+		if err != nil {
+			return cdnv1.CdnTenantSpec{}, err
+		}
+		spec.Domains[i].Cert = string(cert)
+		spec.Domains[i].Key = string(key)
+		if spec.Domains[i].TLS == nil {
+			spec.Domains[i].TLS = &cdnv1.DomainTLS{}
+		}
+		spec.Domains[i].TLS.Mode = "provided"
+	}
+	return spec, nil
 }
 
 func (r *CdnTenantReconciler) getTenantSpecConfig(tenant *cdnv1.CdnTenant, configKey string, defaultValue string) string {
@@ -302,7 +654,8 @@ func (r *CdnTenantReconciler) getTenantSpecConfigInt(tenant *cdnv1.CdnTenant, co
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -360,6 +713,13 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", fmt.Sprintf("Namespace %s", opres))
 		}
 		log.V(1).Info("Reconciled Namespace", "opres", opres)
+		domainTLSStatuses, err := r.reconcileDomainTLSResources(ctx, tenant)
+		if err != nil {
+			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonReconcileFailed, "Failed to reconcile domain TLS resources")
+		}
+		if err := r.updateDomainTLSStatus(ctx, req, tenant, domainTLSStatuses); err != nil {
+			return ctrl.Result{}, err
+		}
 		deployment := &appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "tenant",
@@ -401,10 +761,13 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			c.Image = r.getTenantSpecConfig(tenant, "IMAGE", defaultImage)
 			ports := []corev1.ContainerPort{
 				{
+					ContainerPort: 80,
+				},
+				{
 					ContainerPort: 443,
 				},
 			}
-			if !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.Containers[0].Ports, c.Ports) {
+			if !equality.Semantic.DeepEqual(c.Ports, ports) {
 				c.Ports = ports
 			}
 			env := []corev1.EnvVar{
@@ -418,14 +781,44 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 					Name:  fmt.Sprintf("D%d_NAME", i),
 					Value: domain.Name,
 				})
-				env = append(env, corev1.EnvVar{
-					Name:  fmt.Sprintf("D%d_CERT", i),
-					Value: domain.Cert,
-				})
-				env = append(env, corev1.EnvVar{
-					Name:  fmt.Sprintf("D%d_KEY", i),
-					Value: domain.Key,
-				})
+				mode := domainTLSMode(domain)
+				if domain.TLS != nil {
+					env = append(env, corev1.EnvVar{
+						Name:  fmt.Sprintf("D%d_TLS_MODE", i),
+						Value: mode,
+					})
+					env = append(env, corev1.EnvVar{
+						Name:  fmt.Sprintf("D%d_TLS_MIN_VERSION", i),
+						Value: domainTLSMinVersion(domain),
+					})
+					env = append(env, corev1.EnvVar{
+						Name:  fmt.Sprintf("D%d_TLS_MAX_VERSION", i),
+						Value: domainTLSMaxVersion(domain),
+					})
+					env = append(env, corev1.EnvVar{
+						Name:  fmt.Sprintf("D%d_REDIRECT_HTTP_TO_HTTPS", i),
+						Value: strconv.FormatBool(domainRedirectHTTPToHTTPS(domain)),
+					})
+				}
+				if mode == "letsencrypt" {
+					env = append(env, corev1.EnvVar{
+						Name:  fmt.Sprintf("D%d_CERT_PATH", i),
+						Value: fmt.Sprintf("%s/%s", domainCertificateMountPath(i), corev1.TLSCertKey),
+					})
+					env = append(env, corev1.EnvVar{
+						Name:  fmt.Sprintf("D%d_KEY_PATH", i),
+						Value: fmt.Sprintf("%s/%s", domainCertificateMountPath(i), corev1.TLSPrivateKeyKey),
+					})
+				} else {
+					env = append(env, corev1.EnvVar{
+						Name:  fmt.Sprintf("D%d_CERT", i),
+						Value: domain.Cert,
+					})
+					env = append(env, corev1.EnvVar{
+						Name:  fmt.Sprintf("D%d_KEY", i),
+						Value: domain.Key,
+					})
+				}
 				for k, v := range tenant.Spec.Domains[i].Config {
 					env = append(env, corev1.EnvVar{
 						Name:  fmt.Sprintf("D%d_%s", i, strings.ToUpper(k)),
@@ -471,6 +864,39 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			}
 			if !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.Containers[0].Env, env) {
 				c.Env = env
+			}
+			volumes := []corev1.Volume{}
+			volumeMounts := []corev1.VolumeMount{}
+			optionalSecret := true
+			for i, domain := range tenant.Spec.Domains {
+				if domainTLSMode(domain) != "letsencrypt" {
+					continue
+				}
+				volumeName := fmt.Sprintf("domain-cert-%d", i)
+				volumes = append(volumes, corev1.Volume{
+					Name: volumeName,
+					VolumeSource: corev1.VolumeSource{
+						Secret: &corev1.SecretVolumeSource{
+							SecretName: domainCertificateSecretName(i, domain.Name),
+							Optional:   &optionalSecret,
+						},
+					},
+				})
+				volumeMounts = append(volumeMounts, corev1.VolumeMount{
+					Name:      volumeName,
+					MountPath: domainCertificateMountPath(i),
+					ReadOnly:  true,
+				})
+			}
+			if len(volumes) == 0 {
+				volumes = nil
+				volumeMounts = nil
+			}
+			if !equality.Semantic.DeepEqual(ps.Volumes, volumes) {
+				ps.Volumes = volumes
+			}
+			if !equality.Semantic.DeepEqual(c.VolumeMounts, volumeMounts) {
+				c.VolumeMounts = volumeMounts
 			}
 			return nil
 		})
@@ -543,6 +969,14 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		log.V(1).Info("Deployment is ready")
+		if !allDomainTLSReady(domainTLSStatuses) {
+			message := "Waiting for one or more domain TLS certificates to become ready"
+			if err := r.setDomainTLSPendingConditions(ctx, req, tenant, message); err != nil {
+				return ctrl.Result{}, err
+			}
+			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", message)
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
 		requeueAfter, err := r.syncSecondaries(req, ctx, tenant)
 		if err != nil {
 			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonSyncFailed, "Failed to sync updates to secondaries")
@@ -663,6 +1097,7 @@ func (r *CdnTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&cdnv1.CdnTenant{}).
 		Watches(&appsv1.Deployment{}, h).
 		Watches(&corev1.Service{}, h).
+		Watches(&corev1.Secret{}, h).
 		Watches(&corev1.Secret{}, configH).
 		Complete(r)
 }
@@ -695,9 +1130,18 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 			}
 			updateTenantAnnotations := make(map[string]string)
 			requeueAfter := time.Duration(0)
-			tenantHash, err := r.getTenantHash(tenant)
-			if err != nil {
-				return 0, err
+			var secondarySpec *cdnv1.CdnTenantSpec
+			tenantHash := "deleted"
+			if tenant.DeletionTimestamp.IsZero() {
+				spec, err := r.secondaryTenantSpec(ctx, tenant)
+				if err != nil {
+					return 0, err
+				}
+				secondarySpec = &spec
+				tenantHash, err = getTenantSpecHash(spec)
+				if err != nil {
+					return 0, err
+				}
 			}
 			for name, secondaryConfig := range secondaries {
 				syncStatus, ok := tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)]
@@ -733,6 +1177,9 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 							log.Error(err, "Failed to re-fetch tenant")
 							return 0, err
 						}
+						if tenant.Annotations == nil {
+							tenant.Annotations = map[string]string{}
+						}
 						for k, v := range updateTenantAnnotations {
 							tenant.Annotations[k] = v
 						}
@@ -741,7 +1188,7 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 						}
 					}
 					updateTenantAnnotations = make(map[string]string)
-					requeue, err := r.syncSecondary(ctx, tenant, name, secondaryConfig, primaryKey)
+					requeue, err := r.syncSecondary(ctx, tenant, secondarySpec, name, secondaryConfig, primaryKey)
 					if err != nil {
 						log.V(1).Info(fmt.Sprintf("Failed to sync secondary (%s)", name))
 						return 0, err
@@ -776,6 +1223,9 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 					logf.FromContext(ctx).Error(err, "Failed to re-fetch tenant")
 					return 0, err
 				}
+				if tenant.Annotations == nil {
+					tenant.Annotations = map[string]string{}
+				}
 				for k, v := range updateTenantAnnotations {
 					tenant.Annotations[k] = v
 				}
@@ -788,13 +1238,13 @@ func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Cont
 	}
 }
 
-func (r *CdnTenantReconciler) syncSecondary(ctx context.Context, tenant *cdnv1.CdnTenant, name string, config map[string]string, primaryKey string) (bool, error) {
+func (r *CdnTenantReconciler) syncSecondary(ctx context.Context, tenant *cdnv1.CdnTenant, secondarySpec *cdnv1.CdnTenantSpec, name string, config map[string]string, primaryKey string) (bool, error) {
 	action := "delete"
 	var body io.Reader
 	if tenant.DeletionTimestamp.IsZero() {
 		action = "apply"
 		m := make(map[string]interface{})
-		b, err := json.Marshal(tenant.Spec)
+		b, err := json.Marshal(secondarySpec)
 		if err != nil {
 			return false, err
 		}
@@ -852,13 +1302,17 @@ func (r *CdnTenantReconciler) syncSecondary(ctx context.Context, tenant *cdnv1.C
 
 func (r *CdnTenantReconciler) getTenantHash(tenant *cdnv1.CdnTenant) (string, error) {
 	if tenant.DeletionTimestamp.IsZero() {
-		b, err := json.Marshal(tenant.Spec)
-		if err != nil {
-			return "", err
-		}
-		h := sha256.Sum256(b)
-		return hex.EncodeToString(h[:]), nil
+		return getTenantSpecHash(tenant.Spec)
 	} else {
 		return "deleted", nil
 	}
+}
+
+func getTenantSpecHash(spec cdnv1.CdnTenantSpec) (string, error) {
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:]), nil
 }
