@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"log"
+	"os"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -46,6 +47,73 @@ func (c noMatchDeleteClient) Delete(ctx context.Context, obj client.Object, opts
 }
 
 var _ = Describe("CdnTenant Controller", func() {
+	Context("When deriving domain TLS configuration", func() {
+		It("should default existing domains to provided TLS without redirect", func() {
+			domain := cdnv1.Domain{Name: "test.example.com", Cert: "cert", Key: "key"}
+			Expect(domainTLSMode(domain)).To(Equal("provided"))
+			Expect(domainTLSMinVersion(domain)).To(Equal("TLSv1.2"))
+			Expect(domainTLSMaxVersion(domain)).To(Equal("TLSv1.3"))
+			Expect(domainRedirectHTTPToHTTPS(domain)).To(BeFalse())
+		})
+
+		It("should use stable internal certificate resource names for letsencrypt domains", func() {
+			name := domainCertificateResourceName(0, "customer.example.com")
+			Expect(name).To(Equal(domainCertificateSecretName(0, "customer.example.com")))
+			Expect(name).To(HavePrefix("tenant-domain-0-"))
+			Expect(len(name)).To(BeNumerically("<=", 63))
+		})
+
+		It("should generate usable placeholder TLS secret data", func() {
+			data, err := generatePlaceholderTLSSecretData("customer.example.com")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(data).To(HaveKey(corev1.TLSCertKey))
+			Expect(data).To(HaveKey(corev1.TLSPrivateKeyKey))
+			Expect(string(data[corev1.TLSCertKey])).To(ContainSubstring("BEGIN CERTIFICATE"))
+			Expect(string(data[corev1.TLSPrivateKeyKey])).To(ContainSubstring("BEGIN RSA PRIVATE KEY"))
+		})
+
+		It("should use cert-manager Ready condition for letsencrypt readiness", func() {
+			certificate := &unstructured.Unstructured{Object: map[string]interface{}{
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{"type": "Ready", "status": "False"},
+					},
+				},
+			}}
+			Expect(certificateReady(certificate)).To(BeFalse())
+			certificate.Object["status"].(map[string]interface{})["conditions"] = []interface{}{
+				map[string]interface{}{"type": "Ready", "status": "True"},
+			}
+			Expect(certificateReady(certificate)).To(BeTrue())
+		})
+
+		It("should not issue letsencrypt certificates on secondary clusters", func() {
+			oldValue := os.Getenv(isPrimaryEnvVar)
+			defer os.Setenv(isPrimaryEnvVar, oldValue)
+			Expect(os.Setenv(isPrimaryEnvVar, "false")).To(Succeed())
+
+			controllerReconciler := &CdnTenantReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Recorder: &record.FakeRecorder{},
+			}
+			statuses, err := controllerReconciler.reconcileDomainTLSResources(context.Background(), &cdnv1.CdnTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: "tenant-secondary", Namespace: "default"},
+				Spec: cdnv1.CdnTenantSpec{
+					Domains: []cdnv1.Domain{{
+						Name: "customer.example.com",
+						TLS:  &cdnv1.DomainTLS{Mode: "letsencrypt"},
+					}},
+				},
+			})
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(statuses).To(HaveLen(1))
+			Expect(statuses[0].Ready).To(BeFalse())
+			Expect(statuses[0].Reason).To(Equal("LetsEncryptUnsupportedOnSecondary"))
+		})
+	})
+
 	Context("When reconciling a resource", func() {
 		const resourceName = "tenant1"
 
@@ -133,6 +201,10 @@ var _ = Describe("CdnTenant Controller", func() {
 			Expect(deploy.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(deploy.Spec.Template.Spec.Containers[0].Name).To(Equal("nginx"))
 			Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal("test"))
+			Expect(deploy.Spec.Template.Spec.Containers[0].Ports).To(ConsistOf([]corev1.ContainerPort{
+				{ContainerPort: 80, Protocol: corev1.ProtocolTCP},
+				{ContainerPort: 443, Protocol: corev1.ProtocolTCP},
+			}))
 			Expect(deploy.Spec.Template.Spec.Containers[0].Env).To(ConsistOf([]corev1.EnvVar{
 				{Name: "TENANT_NAME", Value: "tenant1"},
 				{Name: "D0_NAME", Value: "test.example.com"},
@@ -141,6 +213,8 @@ var _ = Describe("CdnTenant Controller", func() {
 				{Name: "D0_EXAMPLE", Value: "value"},
 				{Name: "D0_FOO", Value: "BAR"},
 				{Name: "O0_URL", Value: "http://example.com"},
+				{Name: "O0_NAME", Value: "origin-0"},
+				{Name: "O0_WEIGHT", Value: "1"},
 				{Name: "O0_HELLO", Value: "world"},
 				{Name: "O0_TEST", Value: "123"},
 				{Name: "KEY", Value: "value"},
@@ -231,6 +305,15 @@ var _ = Describe("CdnTenant Controller", func() {
 			degradedCondition := meta.FindStatusCondition(tenant.Status.Conditions, cdnv1.TypeDegraded)
 			Expect(degradedCondition).NotTo(BeNil())
 			Expect(degradedCondition.Status).To(Equal(metav1.ConditionFalse))
+
+			By("Verifying domain TLS status is surfaced without internal resource names")
+			Expect(tenant.Status.DomainTLS).To(ConsistOf(cdnv1.DomainTLSStatus{
+				Name:    "notready.example.com",
+				Mode:    "provided",
+				Ready:   true,
+				Reason:  "ProvidedCertificateConfigured",
+				Message: "Provided certificate and key are configured",
+			}))
 		})
 	})
 
@@ -1200,8 +1283,86 @@ var _ = Describe("CdnTenant Controller", func() {
 			}
 
 			Expect(envMap).To(HaveKeyWithValue("O0_URL", "http://backend1.example.com:8080"))
+			Expect(envMap).To(HaveKeyWithValue("O0_NAME", "origin-0"))
+			Expect(envMap).To(HaveKeyWithValue("O0_WEIGHT", "1"))
 			Expect(envMap).To(HaveKeyWithValue("O0_TIMEOUT", "30"))
 			Expect(envMap).To(HaveKeyWithValue("O0_RETRY_COUNT", "3"))
+		})
+
+		It("should correctly set multiple origins and health check environment variables", func() {
+			const resourceName = "tenant-multi-origin-config"
+			typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
+			weight := int32(2)
+			healthEnabled := true
+			expectedStatus := int32(204)
+			healthyThreshold := int32(1)
+			unhealthyThreshold := int32(2)
+
+			resource := &cdnv1.CdnTenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName,
+					Namespace: "default",
+				},
+				Spec: cdnv1.CdnTenantSpec{
+					Domains: []cdnv1.Domain{{Name: "multi.example.com", Cert: "cert", Key: "key"}},
+					Origins: []cdnv1.Origin{
+						{
+							Name:   "origin-a",
+							Url:    "http://origin-a.example.com",
+							Weight: &weight,
+							HealthCheck: &cdnv1.OriginHealthCheck{
+								Enabled:            &healthEnabled,
+								Path:               "/healthz",
+								ExpectedStatus:     &expectedStatus,
+								Interval:           "5s",
+								Timeout:            "500ms",
+								HealthyThreshold:   &healthyThreshold,
+								UnhealthyThreshold: &unhealthyThreshold,
+							},
+						},
+						{
+							Url: "https://origin-b.example.com",
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			controllerReconciler := &CdnTenantReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Recorder: &record.FakeRecorder{},
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			deploy := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Namespace: resourceName,
+				Name:      "tenant",
+			}, deploy)).To(Succeed())
+
+			envMap := make(map[string]string)
+			for _, env := range deploy.Spec.Template.Spec.Containers[0].Env {
+				envMap[env.Name] = env.Value
+			}
+
+			Expect(envMap).To(HaveKeyWithValue("O0_URL", "http://origin-a.example.com"))
+			Expect(envMap).To(HaveKeyWithValue("O0_NAME", "origin-a"))
+			Expect(envMap).To(HaveKeyWithValue("O0_WEIGHT", "2"))
+			Expect(envMap).To(HaveKeyWithValue("O0_HEALTHCHECK_ENABLED", "true"))
+			Expect(envMap).To(HaveKeyWithValue("O0_HEALTHCHECK_PATH", "/healthz"))
+			Expect(envMap).To(HaveKeyWithValue("O0_HEALTHCHECK_EXPECTEDSTATUS", "204"))
+			Expect(envMap).To(HaveKeyWithValue("O0_HEALTHCHECK_INTERVAL", "5s"))
+			Expect(envMap).To(HaveKeyWithValue("O0_HEALTHCHECK_TIMEOUT", "500ms"))
+			Expect(envMap).To(HaveKeyWithValue("O0_HEALTHCHECK_HEALTHYTHRESHOLD", "1"))
+			Expect(envMap).To(HaveKeyWithValue("O0_HEALTHCHECK_UNHEALTHYTHRESHOLD", "2"))
+			Expect(envMap).To(HaveKeyWithValue("O1_URL", "https://origin-b.example.com"))
+			Expect(envMap).To(HaveKeyWithValue("O1_NAME", "origin-1"))
+			Expect(envMap).To(HaveKeyWithValue("O1_WEIGHT", "1"))
 		})
 
 		It("should set TENANT_NAME environment variable", func() {
@@ -1610,10 +1771,12 @@ var _ = Describe("CdnTenant Controller", func() {
 
 			Expect(httpPort).NotTo(BeNil())
 			Expect(httpPort.Port).To(Equal(int32(80)))
+			Expect(httpPort.TargetPort.IntVal).To(Equal(int32(80)))
 			Expect(httpPort.Protocol).To(Equal(corev1.ProtocolTCP))
 
 			Expect(httpsPort).NotTo(BeNil())
 			Expect(httpsPort.Port).To(Equal(int32(443)))
+			Expect(httpsPort.TargetPort.IntVal).To(Equal(int32(443)))
 			Expect(httpsPort.Protocol).To(Equal(corev1.ProtocolTCP))
 		})
 
@@ -1863,5 +2026,28 @@ var _ = Describe("CdnTenant Controller", func() {
 		Expect(err).NotTo(HaveOccurred())
 		log.Printf("Hash1: %s", hash1)
 		Expect(hash1).To(Equal("d1f647f4a28f265f991c63769448b5d82db1714d8df27f73bc227ea4554e658d"))
+	})
+
+	It("should include propagated certificate data in secondary tenant hash", func() {
+		baseSpec := cdnv1.CdnTenantSpec{
+			Domains: []cdnv1.Domain{{
+				Name: "example.com",
+				TLS:  &cdnv1.DomainTLS{Mode: "provided"},
+				Cert: "cert-1",
+				Key:  "key-1",
+			}},
+			Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
+		}
+		renewedSpec, err := cloneTenantSpec(baseSpec)
+		Expect(err).NotTo(HaveOccurred())
+		renewedSpec.Domains[0].Cert = "cert-2"
+		renewedSpec.Domains[0].Key = "key-2"
+
+		baseHash, err := getTenantSpecHash(baseSpec)
+		Expect(err).NotTo(HaveOccurred())
+		renewedHash, err := getTenantSpecHash(renewedSpec)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(renewedHash).NotTo(Equal(baseHash))
 	})
 })

@@ -89,12 +89,33 @@ spec:
                       type: string
                     name:
                       type: string
+                    tls:
+                      properties:
+                        maxVersion:
+                          enum:
+                          - TLSv1.2
+                          - TLSv1.3
+                          type: string
+                        minVersion:
+                          enum:
+                          - TLSv1.2
+                          - TLSv1.3
+                          type: string
+                        mode:
+                          enum:
+                          - provided
+                          - letsencrypt
+                          type: string
+                        redirectHttpToHttps:
+                          type: boolean
+                      type: object
+                      x-kubernetes-validations:
+                      - message: minVersion cannot be greater than maxVersion
+                        rule: '!(has(self.minVersion) && has(self.maxVersion) && self.minVersion
+                          == ''TLSv1.3'' && self.maxVersion == ''TLSv1.2'')'
                   required:
-                  - cert
-                  - key
                   - name
                   type: object
-                maxItems: 1
                 minItems: 1
                 type: array
               elasticsearch:
@@ -119,14 +140,73 @@ spec:
                       additionalProperties:
                         type: string
                       type: object
-                    url:
+                    healthCheck:
+                      properties:
+                        enabled:
+                          description: Enabled controls active origin health checks.
+                            Defaults to true when omitted.
+                          type: boolean
+                        expectedStatus:
+                          description: ExpectedStatus is the HTTP status considered
+                            healthy. Defaults to 200 when omitted.
+                          format: int32
+                          maximum: 599
+                          minimum: 100
+                          type: integer
+                        healthyThreshold:
+                          description: HealthyThreshold is the consecutive success
+                            count required to mark healthy. Defaults to 2 when omitted.
+                          format: int32
+                          minimum: 1
+                          type: integer
+                        interval:
+                          description: Interval is the active health check interval,
+                            e.g. 10s. Defaults to 10s when omitted.
+                          type: string
+                        path:
+                          description: Path is requested for active origin health
+                            checks. Defaults to / when omitted.
+                          maxLength: 2048
+                          pattern: ^/.*
+                          type: string
+                        timeout:
+                          description: Timeout is the active health check timeout,
+                            e.g. 2s. Defaults to 2s when omitted.
+                          type: string
+                        unhealthyThreshold:
+                          description: UnhealthyThreshold is the consecutive failure
+                            count required to mark unhealthy. Defaults to 3 when omitted.
+                          format: int32
+                          minimum: 1
+                          type: integer
+                      type: object
+                    name:
+                      description: Name identifies this origin in generated config,
+                        logs, and health output.
+                      maxLength: 63
                       type: string
+                    url:
+                      maxLength: 2048
+                      type: string
+                    weight:
+                      description: Weight controls load-balancing preference. Defaults
+                        to 1 when omitted.
+                      format: int32
+                      minimum: 1
+                      type: integer
                   required:
                   - url
                   type: object
-                maxItems: 1
+                maxItems: 32
                 minItems: 1
                 type: array
+                x-kubernetes-validations:
+                - message: origin URLs must use http or https scheme and include a
+                    host
+                  rule: self.all(o, o.url.matches('^https?://[^/?#]+($|[/?#])'))
+                - message: path-prefixed origin URLs are not supported with multiple
+                    origins
+                  rule: self.size() == 1 || self.all(o, !(o.url.matches('^https?://[^/]+/.+')))
             required:
             - domains
             - origins
@@ -226,6 +306,27 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              domainTLS:
+                items:
+                  properties:
+                    message:
+                      type: string
+                    mode:
+                      type: string
+                    name:
+                      type: string
+                    ready:
+                      type: boolean
+                    reason:
+                      type: string
+                  required:
+                  - message
+                  - mode
+                  - name
+                  - ready
+                  - reason
+                  type: object
+                type: array
             type: object
         required:
         - spec

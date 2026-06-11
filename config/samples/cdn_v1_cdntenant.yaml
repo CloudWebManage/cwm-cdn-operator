@@ -7,7 +7,15 @@ metadata:
   name: cdntenant-sample
 spec:
   origins:
-    - url: http://example.com
+    - name: origin-a
+      url: http://example.com
+      weight: 1
+      healthCheck:
+        enabled: true
+        path: /
+        expectedStatus: 200
+        interval: 10s
+        timeout: 2s
   # Optional: Elasticsearch configuration for sending access logs
   # elasticsearch:
   #   enabled: true
@@ -17,6 +25,11 @@ spec:
   #     ENDPOINTS: '["https://elasticsearch.example.com:9200"]'
   domains:
     - name: test.example.com
+      tls:
+        mode: provided
+        minVersion: TLSv1.2
+        maxVersion: TLSv1.3
+        redirectHttpToHttps: false
       # self-signed certificate for testing purposes only
       cert: |
         -----BEGIN CERTIFICATE-----
@@ -67,3 +80,9 @@ spec:
         WOqYnkzOH4wbgNFxDl9vErNroJBTKsQpDhSw9b3KevZiJBB+9LKyD3PoB2d797iy
         1uIOoOkEwmVkebOxiuWa+js=
         -----END PRIVATE KEY-----
+    - name: customer-owned.example.com
+      tls:
+        mode: letsencrypt
+        minVersion: TLSv1.2
+        maxVersion: TLSv1.3
+        redirectHttpToHttps: true
