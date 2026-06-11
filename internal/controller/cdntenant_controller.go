@@ -647,6 +647,50 @@ func (r *CdnTenantReconciler) getTenantSpecConfigInt(tenant *cdnv1.CdnTenant, co
 	return valueInt
 }
 
+func originName(origin cdnv1.Origin, index int) string {
+	if origin.Name != "" {
+		return origin.Name
+	}
+	return fmt.Sprintf("origin-%d", index)
+}
+
+func originWeight(origin cdnv1.Origin) int32 {
+	if origin.Weight != nil && *origin.Weight > 0 {
+		return *origin.Weight
+	}
+	return 1
+}
+
+func originHealthEnvVars(index int, healthCheck *cdnv1.OriginHealthCheck) []corev1.EnvVar {
+	prefix := fmt.Sprintf("O%d_HEALTHCHECK_", index)
+	if healthCheck == nil {
+		return nil
+	}
+	env := []corev1.EnvVar{}
+	if healthCheck.Enabled != nil {
+		env = append(env, corev1.EnvVar{Name: prefix + "ENABLED", Value: strconv.FormatBool(*healthCheck.Enabled)})
+	}
+	if healthCheck.Path != "" {
+		env = append(env, corev1.EnvVar{Name: prefix + "PATH", Value: healthCheck.Path})
+	}
+	if healthCheck.ExpectedStatus != nil {
+		env = append(env, corev1.EnvVar{Name: prefix + "EXPECTEDSTATUS", Value: strconv.Itoa(int(*healthCheck.ExpectedStatus))})
+	}
+	if healthCheck.Interval != "" {
+		env = append(env, corev1.EnvVar{Name: prefix + "INTERVAL", Value: healthCheck.Interval})
+	}
+	if healthCheck.Timeout != "" {
+		env = append(env, corev1.EnvVar{Name: prefix + "TIMEOUT", Value: healthCheck.Timeout})
+	}
+	if healthCheck.HealthyThreshold != nil {
+		env = append(env, corev1.EnvVar{Name: prefix + "HEALTHYTHRESHOLD", Value: strconv.Itoa(int(*healthCheck.HealthyThreshold))})
+	}
+	if healthCheck.UnhealthyThreshold != nil {
+		env = append(env, corev1.EnvVar{Name: prefix + "UNHEALTHYTHRESHOLD", Value: strconv.Itoa(int(*healthCheck.UnhealthyThreshold))})
+	}
+	return env
+}
+
 // +kubebuilder:rbac:groups=cdn.cloudwm-cdn.com,resources=cdntenants,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cdn.cloudwm-cdn.com,resources=cdntenants/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=cdn.cloudwm-cdn.com,resources=cdntenants/finalizers,verbs=update
@@ -831,6 +875,15 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 					Name:  fmt.Sprintf("O%d_URL", i),
 					Value: origin.Url,
 				})
+				env = append(env, corev1.EnvVar{
+					Name:  fmt.Sprintf("O%d_NAME", i),
+					Value: originName(origin, i),
+				})
+				env = append(env, corev1.EnvVar{
+					Name:  fmt.Sprintf("O%d_WEIGHT", i),
+					Value: strconv.Itoa(int(originWeight(origin))),
+				})
+				env = append(env, originHealthEnvVars(i, origin.HealthCheck)...)
 				for k, v := range tenant.Spec.Origins[i].Config {
 					env = append(env, corev1.EnvVar{
 						Name:  fmt.Sprintf("O%d_%s", i, strings.ToUpper(k)),

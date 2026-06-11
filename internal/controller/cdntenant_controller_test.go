@@ -203,6 +203,8 @@ var _ = Describe("CdnTenant Controller", func() {
 				{Name: "D0_EXAMPLE", Value: "value"},
 				{Name: "D0_FOO", Value: "BAR"},
 				{Name: "O0_URL", Value: "http://example.com"},
+				{Name: "O0_NAME", Value: "origin-0"},
+				{Name: "O0_WEIGHT", Value: "1"},
 				{Name: "O0_HELLO", Value: "world"},
 				{Name: "O0_TEST", Value: "123"},
 				{Name: "KEY", Value: "value"},
@@ -1091,8 +1093,86 @@ var _ = Describe("CdnTenant Controller", func() {
 			}
 
 			Expect(envMap).To(HaveKeyWithValue("O0_URL", "http://backend1.example.com:8080"))
+			Expect(envMap).To(HaveKeyWithValue("O0_NAME", "origin-0"))
+			Expect(envMap).To(HaveKeyWithValue("O0_WEIGHT", "1"))
 			Expect(envMap).To(HaveKeyWithValue("O0_TIMEOUT", "30"))
 			Expect(envMap).To(HaveKeyWithValue("O0_RETRY_COUNT", "3"))
+		})
+
+		It("should correctly set multiple origins and health check environment variables", func() {
+			const resourceName = "tenant-multi-origin-config"
+			typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
+			weight := int32(2)
+			healthEnabled := true
+			expectedStatus := int32(204)
+			healthyThreshold := int32(1)
+			unhealthyThreshold := int32(2)
+
+			resource := &cdnv1.CdnTenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName,
+					Namespace: "default",
+				},
+				Spec: cdnv1.CdnTenantSpec{
+					Domains: []cdnv1.Domain{{Name: "multi.example.com", Cert: "cert", Key: "key"}},
+					Origins: []cdnv1.Origin{
+						{
+							Name:   "origin-a",
+							Url:    "http://origin-a.example.com",
+							Weight: &weight,
+							HealthCheck: &cdnv1.OriginHealthCheck{
+								Enabled:            &healthEnabled,
+								Path:               "/healthz",
+								ExpectedStatus:     &expectedStatus,
+								Interval:           "5s",
+								Timeout:            "500ms",
+								HealthyThreshold:   &healthyThreshold,
+								UnhealthyThreshold: &unhealthyThreshold,
+							},
+						},
+						{
+							Url: "https://origin-b.example.com",
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			controllerReconciler := &CdnTenantReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Recorder: &record.FakeRecorder{},
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			deploy := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Namespace: resourceName,
+				Name:      "tenant",
+			}, deploy)).To(Succeed())
+
+			envMap := make(map[string]string)
+			for _, env := range deploy.Spec.Template.Spec.Containers[0].Env {
+				envMap[env.Name] = env.Value
+			}
+
+			Expect(envMap).To(HaveKeyWithValue("O0_URL", "http://origin-a.example.com"))
+			Expect(envMap).To(HaveKeyWithValue("O0_NAME", "origin-a"))
+			Expect(envMap).To(HaveKeyWithValue("O0_WEIGHT", "2"))
+			Expect(envMap).To(HaveKeyWithValue("O0_HEALTHCHECK_ENABLED", "true"))
+			Expect(envMap).To(HaveKeyWithValue("O0_HEALTHCHECK_PATH", "/healthz"))
+			Expect(envMap).To(HaveKeyWithValue("O0_HEALTHCHECK_EXPECTEDSTATUS", "204"))
+			Expect(envMap).To(HaveKeyWithValue("O0_HEALTHCHECK_INTERVAL", "5s"))
+			Expect(envMap).To(HaveKeyWithValue("O0_HEALTHCHECK_TIMEOUT", "500ms"))
+			Expect(envMap).To(HaveKeyWithValue("O0_HEALTHCHECK_HEALTHYTHRESHOLD", "1"))
+			Expect(envMap).To(HaveKeyWithValue("O0_HEALTHCHECK_UNHEALTHYTHRESHOLD", "2"))
+			Expect(envMap).To(HaveKeyWithValue("O1_URL", "https://origin-b.example.com"))
+			Expect(envMap).To(HaveKeyWithValue("O1_NAME", "origin-1"))
+			Expect(envMap).To(HaveKeyWithValue("O1_WEIGHT", "1"))
 		})
 
 		It("should set TENANT_NAME environment variable", func() {
