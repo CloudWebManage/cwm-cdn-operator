@@ -45,6 +45,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/json"
@@ -68,10 +69,17 @@ const (
 	configEnvVarPrefix       = "CWM_CDN_TENANT_DEFAULT_"
 	defaultImage             = "ghcr.io/cloudwebmanage/cwm-cdn-api-tenant-nginx:latest"
 	defaultReplicas          = 1
+	defaultMaxReplicas       = 5
+	defaultTargetRPSPerPod   = 100
+	defaultScaleDownSeconds  = 300
+	scaledObjectName         = "tenant"
+	prometheusServerAddress  = "http://cdn-api-prometheus-server.cdn-api.svc.cluster.local"
 	defaultClusterIssuer     = "cdn-tenant-certs"
 	placeholderCertKey       = "cdn.cloudwm-cdn.com/placeholder-certificate"
 	isPrimaryEnvVar          = "CWM_CDN_IS_PRIMARY"
 )
+
+var scaledObjectGVK = schema.GroupVersionKind{Group: "keda.sh", Version: "v1alpha1", Kind: "ScaledObject"}
 
 // CdnTenantReconciler reconciles a CdnTenant object
 type CdnTenantReconciler struct {
@@ -164,6 +172,21 @@ func (r *CdnTenantReconciler) setErrorConditions(ctx context.Context, req ctrl.R
 
 // setSuccessConditions sets conditions indicating successful reconciliation.
 func (r *CdnTenantReconciler) setSuccessConditions(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, secondariesSynced bool) error {
+	autoscalingCondition := metav1.Condition{
+		Type:    cdnv1.TypeAutoscaling,
+		Status:  metav1.ConditionFalse,
+		Reason:  cdnv1.ReasonAutoscalingDisabled,
+		Message: "Autoscaling is disabled; fixed replica behavior is active",
+	}
+	if tenantAutoscalingEnabled(tenant) {
+		autoscaling := getAutoscalingSpec(tenant)
+		autoscalingCondition = metav1.Condition{
+			Type:    cdnv1.TypeAutoscaling,
+			Status:  metav1.ConditionTrue,
+			Reason:  cdnv1.ReasonAutoscalingConfigured,
+			Message: fmt.Sprintf("Autoscaling configured with minReplicas=%d maxReplicas=%d", autoscaling.MinReplicas, autoscaling.MaxReplicas),
+		}
+	}
 	conditions := []metav1.Condition{
 		{
 			Type:    cdnv1.TypeProgressing,
@@ -183,6 +206,7 @@ func (r *CdnTenantReconciler) setSuccessConditions(ctx context.Context, req ctrl
 			Reason:  cdnv1.ReasonReconcileSuccess,
 			Message: "Tenant is fully operational",
 		},
+		autoscalingCondition,
 	}
 
 	if secondariesSynced {
@@ -647,6 +671,51 @@ func (r *CdnTenantReconciler) getTenantSpecConfigInt(tenant *cdnv1.CdnTenant, co
 	return valueInt
 }
 
+func getAutoscalingSpec(tenant *cdnv1.CdnTenant) cdnv1.CdnTenantAutoscalingSpec {
+	spec := cdnv1.CdnTenantAutoscalingSpec{}
+	if tenant.Spec.Autoscaling != nil {
+		spec = *tenant.Spec.Autoscaling
+	}
+	if spec.MinReplicas == 0 {
+		spec.MinReplicas = 1
+	}
+	if spec.MaxReplicas == 0 {
+		spec.MaxReplicas = defaultMaxReplicas
+	}
+	if spec.TargetClientRpsPerPod == 0 {
+		spec.TargetClientRpsPerPod = defaultTargetRPSPerPod
+	}
+	if spec.TargetOriginRpsPerPod == 0 {
+		spec.TargetOriginRpsPerPod = defaultTargetRPSPerPod
+	}
+	if spec.ScaleDownStabilization.Duration == 0 {
+		spec.ScaleDownStabilization.Duration = defaultScaleDownSeconds * time.Second
+	}
+	return spec
+}
+
+func tenantAutoscalingEnabled(tenant *cdnv1.CdnTenant) bool {
+	return tenant.Spec.Autoscaling != nil && tenant.Spec.Autoscaling.Enabled
+}
+
+func newScaledObject(tenant *cdnv1.CdnTenant) *unstructured.Unstructured {
+	scaledObject := &unstructured.Unstructured{}
+	scaledObject.SetGroupVersionKind(scaledObjectGVK)
+	scaledObject.SetName(scaledObjectName)
+	scaledObject.SetNamespace(tenant.Name)
+	return scaledObject
+}
+
+func desiredReplicas(deployment *appsv1.Deployment) int32 {
+	if deployment.Spec.Replicas != nil {
+		return *deployment.Spec.Replicas
+	}
+	if deployment.Status.Replicas > 0 {
+		return deployment.Status.Replicas
+	}
+	return 1
+}
+
 func originName(origin cdnv1.Origin, index int) string {
 	if origin.Name != "" {
 		return origin.Name
@@ -659,6 +728,131 @@ func originWeight(origin cdnv1.Origin) int32 {
 		return *origin.Weight
 	}
 	return 1
+}
+
+func scaledObjectMissingOrAPIUnavailable(err error) bool {
+	return apierrors.IsNotFound(err) || meta.IsNoMatchError(err)
+}
+
+func (r *CdnTenantReconciler) reconcileScaledObject(ctx context.Context, tenant *cdnv1.CdnTenant) (controllerutil.OperationResult, error) {
+	if !tenantAutoscalingEnabled(tenant) {
+		scaledObject := newScaledObject(tenant)
+		err := r.Delete(ctx, scaledObject)
+		if scaledObjectMissingOrAPIUnavailable(err) {
+			if meta.IsNoMatchError(err) {
+				logf.FromContext(ctx).V(1).Info("KEDA ScaledObject API is unavailable while autoscaling is disabled; skipping ScaledObject cleanup")
+			}
+			return controllerutil.OperationResultNone, nil
+		}
+		if err != nil {
+			return controllerutil.OperationResultNone, err
+		}
+		return controllerutil.OperationResultUpdated, nil
+	}
+
+	autoscaling := getAutoscalingSpec(tenant)
+	scaledObject := newScaledObject(tenant)
+	return controllerutil.CreateOrUpdate(ctx, r.Client, scaledObject, func() error {
+		if scaledObject.GetAnnotations() == nil {
+			scaledObject.SetAnnotations(map[string]string{})
+		}
+		scaledObject.GetAnnotations()[tenantAnnotationKey] = fmt.Sprintf("%s/%s", tenant.Namespace, tenant.Name)
+		if scaledObject.GetLabels() == nil {
+			scaledObject.SetLabels(map[string]string{})
+		}
+		scaledObject.GetLabels()["app"] = "tenant"
+
+		triggers := []interface{}{
+			map[string]interface{}{
+				"type": "prometheus",
+				"metadata": map[string]interface{}{
+					"serverAddress": prometheusServerAddress,
+					"metricName":    "tenant_client_rps",
+					"query":         fmt.Sprintf(`sum(rate(nginx_http_requests_total{job="tenant", namespace="%s", host!="_"}[2m]))`, tenant.Name),
+					"threshold":     strconv.FormatInt(int64(autoscaling.TargetClientRpsPerPod), 10),
+				},
+			},
+		}
+		if autoscaling.TargetOriginRpsPerPod > 0 {
+			triggers = append(triggers, map[string]interface{}{
+				"type": "prometheus",
+				"metadata": map[string]interface{}{
+					"serverAddress": prometheusServerAddress,
+					"metricName":    "tenant_origin_rps",
+					"query":         fmt.Sprintf(`sum(rate(nginx_http_requests_total{job="tenant", namespace="%s", host="_"}[2m]))`, tenant.Name),
+					"threshold":     strconv.FormatInt(int64(autoscaling.TargetOriginRpsPerPod), 10),
+				},
+			})
+		}
+
+		scaledObject.Object["spec"] = map[string]interface{}{
+			"scaleTargetRef": map[string]interface{}{
+				"name": "tenant",
+			},
+			"minReplicaCount": autoscaling.MinReplicas,
+			"maxReplicaCount": autoscaling.MaxReplicas,
+			"advanced": map[string]interface{}{
+				"horizontalPodAutoscalerConfig": map[string]interface{}{
+					"behavior": map[string]interface{}{
+						"scaleDown": map[string]interface{}{
+							"stabilizationWindowSeconds": int32(autoscaling.ScaleDownStabilization.Duration.Seconds()),
+						},
+					},
+				},
+			},
+			"triggers": triggers,
+		}
+		return nil
+	})
+}
+
+func (r *CdnTenantReconciler) updateAutoscalingStatus(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, deployment *appsv1.Deployment) error {
+	autoscaling := getAutoscalingSpec(tenant)
+	status := &cdnv1.CdnTenantAutoscalingStatus{
+		Enabled:         tenantAutoscalingEnabled(tenant),
+		CurrentReplicas: deployment.Status.ReadyReplicas,
+		DesiredReplicas: desiredReplicas(deployment),
+	}
+	if status.Enabled {
+		status.MinReplicas = autoscaling.MinReplicas
+		status.MaxReplicas = autoscaling.MaxReplicas
+		scaledObject := newScaledObject(tenant)
+		if err := r.Get(ctx, types.NamespacedName{Name: scaledObjectName, Namespace: tenant.Name}, scaledObject); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return err
+			}
+			status.Condition = string(metav1.ConditionUnknown)
+			status.LastMessage = "ScaledObject is not present"
+		} else {
+			status.Condition = string(metav1.ConditionUnknown)
+			status.LastMessage = "ScaledObject reconciled"
+			if conditions, found, _ := unstructured.NestedSlice(scaledObject.Object, "status", "conditions"); found {
+				for _, rawCondition := range conditions {
+					condition, ok := rawCondition.(map[string]interface{})
+					if !ok || condition["type"] != "Ready" {
+						continue
+					}
+					if conditionStatus, ok := condition["status"].(string); ok {
+						status.Condition = conditionStatus
+					}
+					if message, ok := condition["message"].(string); ok {
+						status.LastMessage = message
+					}
+				}
+			}
+		}
+	} else {
+		status.LastMessage = "Autoscaling disabled; fixed replicas are controlled by spec.config.REPLICAS"
+	}
+
+	if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
+		return err
+	}
+	if equality.Semantic.DeepEqual(tenant.Status.Autoscaling, status) {
+		return nil
+	}
+	tenant.Status.Autoscaling = status
+	return r.Status().Update(ctx, tenant)
 }
 
 func originHealthEnvVars(index int, healthCheck *cdnv1.OriginHealthCheck) []corev1.EnvVar {
@@ -699,6 +893,7 @@ func originHealthEnvVars(index int, healthCheck *cdnv1.OriginHealthCheck) []core
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -788,7 +983,9 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				deployment.Spec.Template.Labels = map[string]string{}
 			}
 			deployment.Spec.Template.Labels["app"] = "tenant"
-			deployment.Spec.Replicas = ptr.To(int32(r.getTenantSpecConfigInt(tenant, "REPLICAS", defaultReplicas)))
+			if !tenantAutoscalingEnabled(tenant) {
+				deployment.Spec.Replicas = ptr.To(int32(r.getTenantSpecConfigInt(tenant, "REPLICAS", defaultReplicas)))
+			}
 			ps := &deployment.Spec.Template.Spec
 			tolerations := []corev1.Toleration{{Key: "cwm-iac-worker-role", Operator: corev1.TolerationOpEqual, Value: "cdn", Effect: corev1.TaintEffectNoExecute}}
 			if !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.Tolerations, tolerations) {
@@ -961,6 +1158,15 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", fmt.Sprintf("Deployment %s", opres))
 		}
 		log.V(1).Info("Reconciled Deployment", "opres", opres)
+		scaledObjectOpres, err := r.reconcileScaledObject(ctx, tenant)
+		if err != nil {
+			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonDeploymentFailed, "Failed to reconcile tenant autoscaling")
+		}
+		if scaledObjectOpres != controllerutil.OperationResultNone {
+			hasUpdates = true
+			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", fmt.Sprintf("ScaledObject %s", scaledObjectOpres))
+		}
+		log.V(1).Info("Reconciled tenant autoscaling", "opres", scaledObjectOpres, "enabled", tenantAutoscalingEnabled(tenant))
 		service := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "tenant",
@@ -1012,8 +1218,11 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonDeploymentFailed, "Failed to get Deployment status")
 		}
 		if !isDeploymentReady(deployment) {
+			if err := r.updateAutoscalingStatus(ctx, req, tenant, deployment); err != nil {
+				return ctrl.Result{}, err
+			}
 			message := fmt.Sprintf("Waiting for deployment to be ready (ready: %d, desired: %d)",
-				deployment.Status.ReadyReplicas, *deployment.Spec.Replicas)
+				deployment.Status.ReadyReplicas, desiredReplicas(deployment))
 			log.V(1).Info(message)
 			if err := r.setDeploymentNotReadyConditions(ctx, req, tenant, message); err != nil {
 				return ctrl.Result{}, err
@@ -1022,6 +1231,9 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		log.V(1).Info("Deployment is ready")
+		if err := r.updateAutoscalingStatus(ctx, req, tenant, deployment); err != nil {
+			return ctrl.Result{}, err
+		}
 		if !allDomainTLSReady(domainTLSStatuses) {
 			message := "Waiting for one or more domain TLS certificates to become ready"
 			if err := r.setDomainTLSPendingConditions(ctx, req, tenant, message); err != nil {
@@ -1146,13 +1358,25 @@ func (r *CdnTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return reqs
 		},
 	)
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&cdnv1.CdnTenant{}).
 		Watches(&appsv1.Deployment{}, h).
 		Watches(&corev1.Service{}, h).
 		Watches(&corev1.Secret{}, h).
-		Watches(&corev1.Secret{}, configH).
-		Complete(r)
+		Watches(&corev1.Secret{}, configH)
+
+	scaledObject := &unstructured.Unstructured{}
+	scaledObject.SetGroupVersionKind(scaledObjectGVK)
+	if _, err := mgr.GetRESTMapper().RESTMapping(scaledObjectGVK.GroupKind(), scaledObjectGVK.Version); err != nil {
+		if !meta.IsNoMatchError(err) {
+			return err
+		}
+		logf.Log.Info("KEDA ScaledObject API is unavailable during setup; skipping ScaledObject watch")
+	} else {
+		b = b.Watches(scaledObject, h)
+	}
+
+	return b.Complete(r)
 }
 
 func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Context, tenant *cdnv1.CdnTenant) (time.Duration, error) {

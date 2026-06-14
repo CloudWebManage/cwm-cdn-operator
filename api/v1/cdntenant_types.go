@@ -37,6 +37,9 @@ const (
 	// TypeSecondariesSynced indicates whether the tenant configuration
 	// has been successfully synchronized to all secondary CDN servers.
 	TypeSecondariesSynced = "SecondariesSynced"
+
+	// TypeAutoscaling indicates whether tenant traffic autoscaling is configured.
+	TypeAutoscaling = "Autoscaling"
 )
 
 // Condition reason constants for CdnTenant status
@@ -85,6 +88,12 @@ const (
 
 	// ReasonDeploymentNotReady indicates the deployment is not yet ready.
 	ReasonDeploymentNotReady = "DeploymentNotReady"
+
+	// ReasonAutoscalingConfigured indicates tenant autoscaling resources are configured.
+	ReasonAutoscalingConfigured = "AutoscalingConfigured"
+
+	// ReasonAutoscalingDisabled indicates tenant autoscaling is disabled.
+	ReasonAutoscalingDisabled = "AutoscalingDisabled"
 
 	// ReasonDomainTLSPending indicates one or more domain certificates are not ready.
 	ReasonDomainTLSPending = "DomainTLSPending"
@@ -194,6 +203,41 @@ type ElasticsearchConfig struct {
 	Config map[string]string `json:"config"`
 }
 
+type CdnTenantAutoscalingSpec struct {
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
+	MinReplicas int32 `json:"minReplicas,omitempty"`
+
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=5
+	MaxReplicas int32 `json:"maxReplicas,omitempty"`
+
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=100
+	TargetClientRpsPerPod int32 `json:"targetClientRpsPerPod,omitempty"`
+
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=100
+	TargetOriginRpsPerPod int32 `json:"targetOriginRpsPerPod,omitempty"`
+
+	// +optional
+	// +kubebuilder:default="300s"
+	ScaleDownStabilization metav1.Duration `json:"scaleDownStabilization,omitempty"`
+}
+
+type CdnTenantAutoscalingStatus struct {
+	Enabled         bool   `json:"enabled"`
+	MinReplicas     int32  `json:"minReplicas,omitempty"`
+	MaxReplicas     int32  `json:"maxReplicas,omitempty"`
+	CurrentReplicas int32  `json:"currentReplicas,omitempty"`
+	DesiredReplicas int32  `json:"desiredReplicas,omitempty"`
+	Condition       string `json:"condition,omitempty"`
+	LastMessage     string `json:"lastMessage,omitempty"`
+}
+
 // CdnTenantSpec defines the desired state of CdnTenant
 type CdnTenantSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
@@ -213,6 +257,10 @@ type CdnTenantSpec struct {
 	// +optional
 	// Elasticsearch configuration for sending access logs
 	Elasticsearch *ElasticsearchConfig `json:"elasticsearch,omitempty"`
+
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="!self.enabled || self.minReplicas <= self.maxReplicas",message="minReplicas must be less than or equal to maxReplicas when autoscaling is enabled"
+	Autoscaling *CdnTenantAutoscalingSpec `json:"autoscaling,omitempty"`
 
 	Config map[string]string `json:"config,omitempty"`
 }
@@ -238,6 +286,9 @@ type CdnTenantStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// +optional
+	Autoscaling *CdnTenantAutoscalingStatus `json:"autoscaling,omitempty"`
 
 	// +optional
 	DomainTLS []DomainTLSStatus `json:"domainTLS,omitempty"`

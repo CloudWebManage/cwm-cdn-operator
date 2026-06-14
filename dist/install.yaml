@@ -47,6 +47,39 @@ spec:
           spec:
             description: spec defines the desired state of CdnTenant
             properties:
+              autoscaling:
+                properties:
+                  enabled:
+                    default: false
+                    type: boolean
+                  maxReplicas:
+                    default: 5
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  minReplicas:
+                    default: 1
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  scaleDownStabilization:
+                    default: 300s
+                    type: string
+                  targetClientRpsPerPod:
+                    default: 100
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  targetOriginRpsPerPod:
+                    default: 100
+                    format: int32
+                    minimum: 1
+                    type: integer
+                type: object
+                x-kubernetes-validations:
+                - message: minReplicas must be less than or equal to maxReplicas when
+                    autoscaling is enabled
+                  rule: '!self.enabled || self.minReplicas <= self.maxReplicas'
               config:
                 additionalProperties:
                   type: string
@@ -189,6 +222,29 @@ spec:
           status:
             description: status defines the observed state of CdnTenant
             properties:
+              autoscaling:
+                properties:
+                  condition:
+                    type: string
+                  currentReplicas:
+                    format: int32
+                    type: integer
+                  desiredReplicas:
+                    format: int32
+                    type: integer
+                  enabled:
+                    type: boolean
+                  lastMessage:
+                    type: string
+                  maxReplicas:
+                    format: int32
+                    type: integer
+                  minReplicas:
+                    format: int32
+                    type: integer
+                required:
+                - enabled
+                type: object
               conditions:
                 description: |-
                   conditions represent the current state of the CdnTenant resource.
@@ -488,6 +544,18 @@ rules:
   - cert-manager.io
   resources:
   - certificates
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - keda.sh
+  resources:
+  - scaledobjects
   verbs:
   - create
   - delete
