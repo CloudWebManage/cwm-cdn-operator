@@ -31,6 +31,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -660,6 +661,9 @@ func (r *CdnTenantReconciler) secondaryTenantSpec(ctx context.Context, tenant *c
 }
 
 func (r *CdnTenantReconciler) failClosedTenantDeployment(ctx context.Context, tenant *cdnv1.CdnTenant, message string) error {
+	if _, err := r.deleteScaledObject(ctx, tenant); err != nil {
+		return err
+	}
 	deployment := &appsv1.Deployment{}
 	if err := r.Get(ctx, types.NamespacedName{Name: "tenant", Namespace: tenant.Name}, deployment); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -690,6 +694,19 @@ func (r *CdnTenantReconciler) getTenantSpecConfig(tenant *cdnv1.CdnTenant, confi
 		}
 	}
 	return value
+}
+
+func tenantDefaultConfig(configKey string, defaultValue string) string {
+	value := os.Getenv(fmt.Sprintf("%s%s", configEnvVarPrefix, configKey))
+	if value == "" {
+		return defaultValue
+	}
+	return value
+}
+
+func boolString(value string) bool {
+	value = strings.ToLower(value)
+	return value == "1" || value == "true" || value == "yes"
 }
 
 func (r *CdnTenantReconciler) getTenantSpecConfigInt(tenant *cdnv1.CdnTenant, configKey string, defaultValue int) int {
@@ -739,6 +756,21 @@ func newScaledObject(tenant *cdnv1.CdnTenant) *unstructured.Unstructured {
 	return scaledObject
 }
 
+func (r *CdnTenantReconciler) deleteScaledObject(ctx context.Context, tenant *cdnv1.CdnTenant) (controllerutil.OperationResult, error) {
+	scaledObject := newScaledObject(tenant)
+	err := r.Delete(ctx, scaledObject)
+	if scaledObjectMissingOrAPIUnavailable(err) {
+		if meta.IsNoMatchError(err) {
+			logf.FromContext(ctx).V(1).Info("KEDA ScaledObject API is unavailable; skipping ScaledObject cleanup")
+		}
+		return controllerutil.OperationResultNone, nil
+	}
+	if err != nil {
+		return controllerutil.OperationResultNone, err
+	}
+	return controllerutil.OperationResultUpdated, nil
+}
+
 func desiredReplicas(deployment *appsv1.Deployment) int32 {
 	if deployment.Spec.Replicas != nil {
 		return *deployment.Spec.Replicas
@@ -769,18 +801,7 @@ func scaledObjectMissingOrAPIUnavailable(err error) bool {
 
 func (r *CdnTenantReconciler) reconcileScaledObject(ctx context.Context, tenant *cdnv1.CdnTenant) (controllerutil.OperationResult, error) {
 	if !tenantAutoscalingEnabled(tenant) {
-		scaledObject := newScaledObject(tenant)
-		err := r.Delete(ctx, scaledObject)
-		if scaledObjectMissingOrAPIUnavailable(err) {
-			if meta.IsNoMatchError(err) {
-				logf.FromContext(ctx).V(1).Info("KEDA ScaledObject API is unavailable while autoscaling is disabled; skipping ScaledObject cleanup")
-			}
-			return controllerutil.OperationResultNone, nil
-		}
-		if err != nil {
-			return controllerutil.OperationResultNone, err
-		}
-		return controllerutil.OperationResultUpdated, nil
+		return r.deleteScaledObject(ctx, tenant)
 	}
 
 	autoscaling := getAutoscalingSpec(tenant)
@@ -1103,7 +1124,6 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			}
 			delete(deployment.Spec.Template.Annotations, "cdn.cloudwm-cdn.com/captcha-secret-ref-hash")
 			delete(deployment.Spec.Template.Annotations, "cdn.cloudwm-cdn.com/signing-key-secret")
-			deployment.Spec.Replicas = ptr.To(int32(r.getTenantSpecConfigInt(tenant, "REPLICAS", defaultReplicas)))
 			ps := &deployment.Spec.Template.Spec
 			tolerations := []corev1.Toleration{{Key: "cwm-iac-worker-role", Operator: corev1.TolerationOpEqual, Value: "cdn", Effect: corev1.TaintEffectNoExecute}}
 			if !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.Tolerations, tolerations) {
@@ -1136,11 +1156,12 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				},
 			}
 			env = appendCacheEnv(env, cacheConfig)
-			env = append(env, corev1.EnvVar{Name: "CDN_POLICY_FILE", Value: policyFilePath})
-			if popID := r.getTenantSpecConfig(tenant, "POP_ID", ""); popID != "" {
+			env = append(env, corev1.EnvVar{Name: "CWM_CDN_POLICY_PATH", Value: policyFilePath})
+			if popID := tenantDefaultConfig("POP_ID", ""); popID != "" {
 				env = append(env, corev1.EnvVar{Name: "POP_ID", Value: popID})
 			}
-			if enablePlatformLogs := r.getTenantSpecConfig(tenant, "ENABLE_PLATFORM_LOGS", ""); enablePlatformLogs != "" {
+			enablePlatformLogs := tenantDefaultConfig("ENABLE_PLATFORM_LOGS", "")
+			if enablePlatformLogs != "" {
 				env = append(env, corev1.EnvVar{Name: "ENABLE_PLATFORM_LOGS", Value: enablePlatformLogs})
 			}
 			if tenant.Spec.Captcha != nil && tenant.Spec.Captcha.Enabled && tenant.Spec.Captcha.SecretRef != nil {
@@ -1220,11 +1241,13 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 					})
 				}
 			}
-			if tenant.Spec.Elasticsearch != nil && tenant.Spec.Elasticsearch.Enabled {
+			if (tenant.Spec.Elasticsearch != nil && tenant.Spec.Elasticsearch.Enabled) || boolString(enablePlatformLogs) {
 				env = append(env, corev1.EnvVar{
 					Name:  "ENABLE_TENANT_ACCESS_LOGS",
 					Value: "true",
 				})
+			}
+			if tenant.Spec.Elasticsearch != nil && tenant.Spec.Elasticsearch.Enabled {
 				env = append(env, corev1.EnvVar{
 					Name:  "ENABLE_ES_SINK",
 					Value: "true",
@@ -1661,6 +1684,13 @@ func (r *CdnTenantReconciler) syncSecondariesSpec(req ctrl.Request, ctx context.
 			if err != nil {
 				secondarySyncAttempts.WithLabelValues(name, "error").Inc()
 				log.Error(err, "Failed to sync secondary", "secondary", name, "tenant", tenant.Name, "hash", tenantHash, "latencySeconds", latency)
+				secondaryStatus.Status = "failed"
+				secondaryStatus.SyncedHash = ""
+				secondaryStatus.LastError = err.Error()
+				statuses = append(statuses, secondaryStatus)
+				if statusErr := r.updateSecondarySyncStatus(ctx, req, tenant, statuses); statusErr != nil {
+					log.Error(statusErr, "Failed to update secondary sync status after sync error", "secondary", name, "tenant", tenant.Name)
+				}
 				return 0, err
 			}
 			if requeue {
@@ -1686,6 +1716,7 @@ func (r *CdnTenantReconciler) syncSecondariesSpec(req ctrl.Request, ctx context.
 			} else {
 				secondaryStatus.Status = "synced"
 				secondaryStatus.SyncedHash = tenantHash
+				secondaryStatus.LastError = ""
 				successTime := metav1.NewTime(time.Now())
 				secondaryStatus.LastSuccessTime = &successTime
 				updateTenantAnnotations[statusKey] = "synced"
@@ -1695,6 +1726,9 @@ func (r *CdnTenantReconciler) syncSecondariesSpec(req ctrl.Request, ctx context.
 				secondarySyncStale.WithLabelValues(name).Set(0)
 				log.Info("Secondary synced successfully", "secondary", name, "tenant", tenant.Name, "hash", tenantHash, "latencySeconds", latency)
 			}
+		}
+		if secondaryStatus.Status == "synced" && secondaryStatus.SyncedHash == tenantHash {
+			secondaryStatus.LastError = ""
 		}
 		if secondaryStatus.Status == "synced" && secondaryStatus.LastSuccessTime != nil {
 			secondarySyncStale.WithLabelValues(name).Set(time.Since(secondaryStatus.LastSuccessTime.Time).Seconds())
@@ -1742,14 +1776,20 @@ func (r *CdnTenantReconciler) syncSecondary(ctx context.Context, tenant *cdnv1.C
 		}
 		body = bytes.NewReader(b)
 	}
-	url := fmt.Sprintf("%s/%s?cdn_tenant_name=%s", config["url"], action, tenant.Name)
-	if action == "delete" {
-		url += "&primary_key=" + primaryKey
+	targetURL, err := neturl.Parse(fmt.Sprintf("%s/%s", strings.TrimRight(config["url"], "/"), action))
+	if err != nil {
+		return false, err
 	}
+	query := targetURL.Query()
+	query.Set("cdn_tenant_name", tenant.Name)
+	if action == "delete" {
+		query.Set("primary_key", primaryKey)
+	}
+	targetURL.RawQuery = query.Encode()
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		url,
+		targetURL.String(),
 		body,
 	)
 	if err != nil {

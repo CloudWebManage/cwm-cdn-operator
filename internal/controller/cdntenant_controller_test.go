@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	stdjson "encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -217,7 +218,7 @@ var _ = Describe("CdnTenant Controller", func() {
 				{Name: "CACHE_EDGE_TTL_SECONDS", Value: "3600"},
 				{Name: "CACHE_RESPECT_ORIGIN_CACHE_CONTROL", Value: "true"},
 				{Name: "CACHE_STATUS_HEADER", Value: "X-CWM-Cache-Status"},
-				{Name: "CDN_POLICY_FILE", Value: "/etc/cwm-cdn/policy.json"},
+				{Name: "CWM_CDN_POLICY_PATH", Value: "/etc/cwm-cdn/policy.json"},
 				{Name: "D0_NAME", Value: "test.example.com"},
 				{Name: "D0_KEY", Value: "bbb"},
 				{Name: "D0_CERT", Value: "aaa"},
@@ -1038,13 +1039,27 @@ var _ = Describe("CdnTenant Controller", func() {
 			header := "Set-Cookie"
 			_, err := effectiveCache(&cdnv1.CacheConfig{StatusHeader: &header})
 			Expect(err).To(HaveOccurred())
+			header = "X-CWMCDN-Cache-Enabled"
+			_, err = effectiveCache(&cdnv1.CacheConfig{StatusHeader: &header})
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should reject cache semantics that the cache layer cannot honor yet", func() {
+			_, err := effectiveCache(&cdnv1.CacheConfig{EdgeTtl: "5m"})
+			Expect(err).To(MatchError(ContainSubstring("dynamic TTL")))
+			respectOrigin := false
+			_, err = effectiveCache(&cdnv1.CacheConfig{RespectOriginCacheControl: &respectOrigin})
+			Expect(err).To(MatchError(ContainSubstring("origin-header override")))
 		})
 
 		It("should render typed cache env vars and policy file without loose config override", func() {
+			Expect(os.Setenv("CWM_CDN_TENANT_DEFAULT_ENABLE_PLATFORM_LOGS", "true")).To(Succeed())
+			Expect(os.Setenv("CWM_CDN_TENANT_DEFAULT_POP_ID", "pop-test")).To(Succeed())
+			defer os.Unsetenv("CWM_CDN_TENANT_DEFAULT_ENABLE_PLATFORM_LOGS")
+			defer os.Unsetenv("CWM_CDN_TENANT_DEFAULT_POP_ID")
 			const resourceName = "tenant-cache-policy"
 			typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
 			enabled := false
-			respectOrigin := false
 			header := "X-Cache-Test"
 			resource := &cdnv1.CdnTenant{
 				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
@@ -1052,16 +1067,12 @@ var _ = Describe("CdnTenant Controller", func() {
 					Domains: []cdnv1.Domain{{Name: "cache.example.com", Cert: "cert", Key: "key"}},
 					Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
 					Cache: &cdnv1.CacheConfig{
-						Enabled:                   &enabled,
-						Mode:                      "cache_everything",
-						EdgeTtl:                   "2h",
-						RespectOriginCacheControl: &respectOrigin,
-						StatusHeader:              &header,
+						Enabled:      &enabled,
+						Mode:         "cache_everything",
+						StatusHeader: &header,
 					},
 					Config: map[string]string{
-						"CACHE_EDGE_TTL_SECONDS": "999",
-						"ENABLE_PLATFORM_LOGS":   "true",
-						"POP_ID":                 "pop-test",
+						"CUSTOM_VAR": "custom_value",
 					},
 				},
 			}
@@ -1078,16 +1089,20 @@ var _ = Describe("CdnTenant Controller", func() {
 				envMap[env.Name] = env.Value
 			}
 			Expect(envMap).To(HaveKeyWithValue("CACHE_ENABLED", "false"))
-			Expect(envMap).To(HaveKeyWithValue("CACHE_EDGE_TTL_SECONDS", "7200"))
-			Expect(envMap).To(HaveKeyWithValue("CACHE_RESPECT_ORIGIN_CACHE_CONTROL", "false"))
+			Expect(envMap).To(HaveKeyWithValue("CACHE_EDGE_TTL_SECONDS", "3600"))
+			Expect(envMap).To(HaveKeyWithValue("CACHE_RESPECT_ORIGIN_CACHE_CONTROL", "true"))
 			Expect(envMap).To(HaveKeyWithValue("CACHE_STATUS_HEADER", "X-Cache-Test"))
-			Expect(envMap).To(HaveKeyWithValue("CDN_POLICY_FILE", "/etc/cwm-cdn/policy.json"))
+			Expect(envMap).To(HaveKeyWithValue("CWM_CDN_POLICY_PATH", "/etc/cwm-cdn/policy.json"))
+			Expect(envMap).NotTo(HaveKey("TENANT_POLICY_JSON"))
+			Expect(envMap).NotTo(HaveKey("CWM_CDN_POP_ID"))
 			Expect(envMap).To(HaveKeyWithValue("ENABLE_PLATFORM_LOGS", "true"))
+			Expect(envMap).To(HaveKeyWithValue("ENABLE_TENANT_ACCESS_LOGS", "true"))
 			Expect(envMap).To(HaveKeyWithValue("POP_ID", "pop-test"))
+			Expect(envMap).To(HaveKeyWithValue("CUSTOM_VAR", "custom_value"))
 
 			policy := &corev1.ConfigMap{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: policyConfigMapName}, policy)).To(Succeed())
-			Expect(policy.Data[policyConfigMapKey]).To(ContainSubstring("\"edgeTtlSeconds\": 7200"))
+			Expect(policy.Data[policyConfigMapKey]).To(ContainSubstring("\"edgeTtlSeconds\": 3600"))
 			Expect(deploy.Spec.Template.Annotations).To(HaveKey("cdn.cloudwm-cdn.com/policy-hash"))
 		})
 	})
@@ -1106,8 +1121,8 @@ var _ = Describe("CdnTenant Controller", func() {
 			_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: configSecretName, Namespace: "default"}})
 		})
 
-		It("should fail closed and set conditions for IP controls without trusted client IP support", func() {
-			const resourceName = "tenant-invalid-ip-policy"
+		It("should fail closed and set conditions for controller policy validation failures", func() {
+			const resourceName = "tenant-invalid-policy"
 			typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
 			var body map[string]interface{}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1131,12 +1146,23 @@ var _ = Describe("CdnTenant Controller", func() {
 					},
 				},
 			})).To(Succeed())
+			scaledObject := newScaledObject(&cdnv1.CdnTenant{ObjectMeta: metav1.ObjectMeta{Name: resourceName}})
+			scaledObject.Object["spec"] = map[string]interface{}{
+				"scaleTargetRef": map[string]interface{}{"name": "tenant"},
+				"triggers":       []interface{}{},
+			}
+			Expect(k8sClient.Create(ctx, scaledObject)).To(Succeed())
 			resource := &cdnv1.CdnTenant{
 				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
 				Spec: cdnv1.CdnTenantSpec{
-					Domains:  []cdnv1.Domain{{Name: "invalid.example.com", Cert: "cert", Key: "key"}},
-					Origins:  []cdnv1.Origin{{Url: "http://origin.example.com"}},
-					Security: &cdnv1.SecurityConfig{IPAccess: &cdnv1.IPAccessConfig{AllowCidrs: []string{"10.0.0.0/8"}}},
+					Domains:     []cdnv1.Domain{{Name: "invalid.example.com", Cert: "cert", Key: "key"}},
+					Origins:     []cdnv1.Origin{{Url: "http://origin.example.com"}},
+					Autoscaling: &cdnv1.CdnTenantAutoscalingSpec{Enabled: true, MinReplicas: 1, MaxReplicas: 5},
+					Redirects: []cdnv1.RedirectRule{{
+						Name: "self",
+						When: cdnv1.RedirectWhen{Path: &cdnv1.RedirectPathMatch{Type: "glob", Value: "/same"}},
+						To:   "/same",
+					}},
 				},
 			}
 			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
@@ -1159,7 +1185,8 @@ var _ = Describe("CdnTenant Controller", func() {
 			Expect(deploy.Spec.Replicas).NotTo(BeNil())
 			Expect(*deploy.Spec.Replicas).To(Equal(int32(0)))
 			Expect(deploy.Spec.Template.Annotations).To(HaveKey("cdn.cloudwm-cdn.com/invalid-policy-hash"))
-			Expect(body).To(HaveKey("security"))
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: scaledObjectName}, scaledObject)).To(MatchError(ContainSubstring("not found")))
+			Expect(body).To(HaveKey("redirects"))
 
 			tenant := &cdnv1.CdnTenant{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, tenant)).To(Succeed())
@@ -1169,35 +1196,73 @@ var _ = Describe("CdnTenant Controller", func() {
 		})
 
 		It("should reject incomplete typed security, captcha, redirect policy fields", func() {
+			manyRules := make([]cdnv1.NamedPathRule, maxPolicyRules+1)
+			for i := range manyRules {
+				manyRules[i] = cdnv1.NamedPathRule{Name: fmt.Sprintf("rule-%d", i), Match: cdnv1.PathMatch{Type: "glob", Path: fmt.Sprintf("/rule-%d", i)}}
+			}
 			resource := &cdnv1.CdnTenant{
 				ObjectMeta: metav1.ObjectMeta{Name: "tenant-invalid-extra-policy", Namespace: "default"},
 				Spec: cdnv1.CdnTenantSpec{
 					Domains: []cdnv1.Domain{{Name: "invalid-extra.example.com", Cert: "cert", Key: "key"}},
 					Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
 					Security: &cdnv1.SecurityConfig{
-						Methods: &cdnv1.MethodsConfig{Allow: []cdnv1.HTTPMethod{"GET", "TRACE"}, Block: []cdnv1.HTTPMethod{"GET"}},
-						Request: &cdnv1.RequestSecurityConfig{MaxBodySize: "2g"},
+						Methods:   &cdnv1.MethodsConfig{Allow: []cdnv1.HTTPMethod{"GET", "GET1"}, Block: []cdnv1.HTTPMethod{"GET"}},
+						RateLimit: &cdnv1.RateLimitConfig{Enabled: true, Requests: 1, Period: "90m", Key: "clientIp", Action: "captcha"},
+						Request:   &cdnv1.RequestSecurityConfig{MaxBodySize: "2g"},
+						URLs:      &cdnv1.URLSecurityConfig{Block: append([]cdnv1.NamedPathRule{{Name: "encoded", Match: cdnv1.PathMatch{Type: "glob", Path: "/%2e%2e/admin"}}}, manyRules...)},
 					},
-					Captcha: &cdnv1.CaptchaConfig{CookieTtl: "30s"},
-					Redirects: []cdnv1.RedirectRule{{
-						Name: "bad-redirect",
-						When: cdnv1.RedirectWhen{
-							Path:           cdnv1.RedirectPathMatch{Type: "glob", Value: "relative/*"},
-							OriginStatus:   []cdnv1.HTTPStatusCode{200, 200},
-							UpstreamStatus: []cdnv1.HTTPStatusCode{700},
+					Captcha: &cdnv1.CaptchaConfig{Enabled: true, Provider: "bad", CookieTtl: "30x", Rules: []cdnv1.NamedPathRule{{Name: "protected", Match: cdnv1.PathMatch{Type: "glob", Path: "/protected/*"}}}},
+					Redirects: []cdnv1.RedirectRule{
+						{
+							Name: "bad-redirect",
+							When: cdnv1.RedirectWhen{
+								Path:           &cdnv1.RedirectPathMatch{Type: "glob", Value: "relative/*"},
+								OriginStatus:   []cdnv1.HTTPStatusCode{200, 200},
+								UpstreamStatus: []cdnv1.HTTPStatusCode{700},
+							},
+							To: "//evil.example.com",
 						},
-						To: "/ok",
-					}},
+						{
+							Name: "missing-path",
+							To:   "/ok",
+						},
+						{
+							Name: "self",
+							When: cdnv1.RedirectWhen{Path: &cdnv1.RedirectPathMatch{Type: "glob", Value: "/same"}},
+							To:   "/same?x=1",
+						},
+					},
 				},
 			}
+			_, sizeErr := parseMaxBodySize("9223372036854775807g")
+			Expect(sizeErr).To(HaveOccurred())
 			errs := validateTenantPolicy(ctx, k8sClient, resource)
-			Expect(strings.Join(errs, "; ")).To(ContainSubstring("security.methods.allow contains unsupported method"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("security.methods.allow contains invalid HTTP method"))
 			Expect(strings.Join(errs, "; ")).To(ContainSubstring("security.methods method"))
 			Expect(strings.Join(errs, "; ")).To(ContainSubstring("security.request.maxBodySize"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("security.urls.block may contain at most"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("encoded path traversal"))
 			Expect(strings.Join(errs, "; ")).To(ContainSubstring("captcha.cookieTtl"))
-			Expect(strings.Join(errs, "; ")).To(ContainSubstring("originStatus and upstreamStatus are mutually exclusive"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("captcha.provider must be turnstile"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("captcha.siteKey is required"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("captcha.secretRef.name and captcha.secretRef.key"))
 			Expect(strings.Join(errs, "; ")).To(ContainSubstring("invalid HTTP status"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("requires at least one matcher"))
 			Expect(strings.Join(errs, "; ")).To(ContainSubstring("when.path.value is invalid"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("to is invalid"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("direct self-redirects are not allowed"))
+
+			protectedConfig := &cdnv1.CdnTenant{Spec: cdnv1.CdnTenantSpec{Config: map[string]string{"POP_ID": "tenant-pop"}}}
+			Expect(strings.Join(validateTenantPolicy(ctx, k8sClient, protectedConfig), "; ")).To(ContainSubstring("platform-managed"))
+
+			ipResource := &cdnv1.CdnTenant{Spec: cdnv1.CdnTenantSpec{Security: &cdnv1.SecurityConfig{IPAccess: &cdnv1.IPAccessConfig{AllowCidrs: []string{"10.0.0.0/8"}}}}}
+			Expect(strings.Join(validateTenantPolicy(ctx, k8sClient, ipResource), "; ")).To(ContainSubstring("trusted client IP"))
+
+			captchaRateLimit := &cdnv1.CdnTenant{Spec: cdnv1.CdnTenantSpec{Security: &cdnv1.SecurityConfig{RateLimit: &cdnv1.RateLimitConfig{Enabled: true, Requests: 1, Period: "1m", Key: "clientIp", Action: "captcha"}}}}
+			Expect(strings.Join(validateTenantPolicy(ctx, k8sClient, captchaRateLimit), "; ")).To(ContainSubstring("security.rateLimit.action=captcha requires captcha.enabled=true"))
+
+			invalid303 := &cdnv1.CdnTenant{Spec: cdnv1.CdnTenantSpec{Redirects: []cdnv1.RedirectRule{{Name: "see-other", When: cdnv1.RedirectWhen{Path: &cdnv1.RedirectPathMatch{Type: "glob", Value: "/old"}}, To: "/new", Status: 303}}}}
+			Expect(strings.Join(validateTenantPolicy(ctx, k8sClient, invalid303), "; ")).To(ContainSubstring("status must be one of"))
 		})
 
 		It("should mount captcha provider and signing-key secrets when captcha is enabled", func() {
@@ -2324,7 +2389,7 @@ var _ = Describe("CdnTenant Controller", func() {
 			}))
 			defer server.Close()
 
-			cacheTTL := "3h"
+			cacheTTL := "1h"
 			resource := &cdnv1.CdnTenant{
 				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default", Annotations: map[string]string{}},
 				Spec: cdnv1.CdnTenantSpec{
@@ -2333,7 +2398,7 @@ var _ = Describe("CdnTenant Controller", func() {
 					Cache:   &cdnv1.CacheConfig{Mode: "cache_everything", EdgeTtl: cacheTTL},
 					Redirects: []cdnv1.RedirectRule{{
 						Name: "docs",
-						When: cdnv1.RedirectWhen{Path: cdnv1.RedirectPathMatch{Type: "glob", Value: "/docs/*"}},
+						When: cdnv1.RedirectWhen{Path: &cdnv1.RedirectPathMatch{Type: "glob", Value: "/docs/*"}},
 						To:   "/new-docs/",
 					}},
 				},
@@ -2369,6 +2434,9 @@ var _ = Describe("CdnTenant Controller", func() {
 			lastSuccess := updated.Status.SecondarySync[0].LastSuccessTime
 			latencySeconds := updated.Status.SecondarySync[0].LatencySeconds
 			Expect(lastSuccess).NotTo(BeNil())
+			updated.Status.SecondarySync[0].LastError = "previous failure"
+			Expect(k8sClient.Status().Update(ctx, updated)).To(Succeed())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
 
 			requeueAfter, err = controllerReconciler.syncSecondaries(reconcile.Request{NamespacedName: typeNamespacedName}, ctx, updated)
 			Expect(err).NotTo(HaveOccurred())
@@ -2378,6 +2446,27 @@ var _ = Describe("CdnTenant Controller", func() {
 			Expect(reconciledAgain.Status.SecondarySync).To(HaveLen(1))
 			Expect(reconciledAgain.Status.SecondarySync[0].LastSuccessTime).To(Equal(lastSuccess))
 			Expect(reconciledAgain.Status.SecondarySync[0].LatencySeconds).To(Equal(latencySeconds))
+			Expect(reconciledAgain.Status.SecondarySync[0].LastError).To(BeEmpty())
+		})
+
+		It("should URL-escape primary keys when syncing deletes", func() {
+			const resourceName = "tenant-secondary-delete-query"
+			primaryKey := "a+b&c=d"
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				Expect(r.URL.Path).To(Equal("/delete"))
+				Expect(r.URL.Query().Get("cdn_tenant_name")).To(Equal(resourceName))
+				Expect(r.URL.Query().Get("primary_key")).To(Equal(primaryKey))
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			deletionTime := metav1.Now()
+			tenant := &cdnv1.CdnTenant{ObjectMeta: metav1.ObjectMeta{Name: resourceName, DeletionTimestamp: &deletionTime}}
+			controllerReconciler := &CdnTenantReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: &record.FakeRecorder{}}
+
+			requeue, err := controllerReconciler.syncSecondary(ctx, tenant, nil, "secondary-a", map[string]string{"url": server.URL, "user": "u", "pass": "p"}, primaryKey)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(requeue).To(BeFalse())
 		})
 	})
 

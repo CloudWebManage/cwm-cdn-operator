@@ -250,7 +250,7 @@ type CacheConfig struct {
 	// +optional
 	Mode string `json:"mode,omitempty"`
 
-	// +kubebuilder:validation:Pattern=`^[0-9]+(ns|us|µs|ms|s|m|h)$`
+	// +kubebuilder:validation:Pattern=`^[0-9]+(s|m|h|d)$`
 	// +optional
 	EdgeTtl string `json:"edgeTtl,omitempty"`
 
@@ -289,15 +289,15 @@ type IPAccessConfig struct {
 	BlockCidrs []string `json:"blockCidrs,omitempty"`
 }
 
-// +kubebuilder:validation:Enum=GET;HEAD;POST;PUT;PATCH;DELETE;OPTIONS
+// +kubebuilder:validation:Pattern=`^[A-Z]+$`
 type HTTPMethod string
 
 type MethodsConfig struct {
-	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:MaxItems=32
 	// +optional
 	Allow []HTTPMethod `json:"allow,omitempty"`
 
-	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:MaxItems=32
 	// +optional
 	Block []HTTPMethod `json:"block,omitempty"`
 }
@@ -323,7 +323,7 @@ type PathMatch struct {
 	Type string `json:"type"`
 
 	// +kubebuilder:validation:MaxLength=512
-	// +kubebuilder:validation:Pattern=`^/[^\r\n\x00]*$`
+	// +kubebuilder:validation:Pattern=`^/[A-Za-z0-9._~/%:@+*,=-]*$`
 	// +required
 	Path string `json:"path"`
 }
@@ -336,7 +336,7 @@ type RateLimitConfig struct {
 	// +optional
 	Requests int `json:"requests,omitempty"`
 
-	// +kubebuilder:validation:Pattern=`^[0-9]+(ns|us|µs|ms|s|m|h)$`
+	// +kubebuilder:validation:Pattern=`^[0-9]+(s|m|h|d)$`
 	// +optional
 	Period string `json:"period,omitempty"`
 
@@ -361,6 +361,7 @@ type RequestSecurityConfig struct {
 }
 
 // CaptchaConfig defines tenant captcha settings.
+// +kubebuilder:validation:XValidation:rule="!has(self.rules) || size(self.rules) == 0 || (has(self.enabled) && self.enabled)",message="captcha.rules require captcha.enabled=true"
 type CaptchaConfig struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
@@ -375,7 +376,7 @@ type CaptchaConfig struct {
 	// +optional
 	SecretRef *LocalSecretKeyRef `json:"secretRef,omitempty"`
 
-	// +kubebuilder:validation:Pattern=`^[0-9]+(ns|us|µs|ms|s|m|h)$`
+	// +kubebuilder:validation:Pattern=`^[0-9]+(s|m|h|d)$`
 	// +optional
 	CookieTtl string `json:"cookieTtl,omitempty"`
 
@@ -415,10 +416,9 @@ type RedirectRule struct {
 	PreserveQuery *bool `json:"preserveQuery,omitempty"`
 }
 
-// +kubebuilder:validation:XValidation:rule="!(has(self.originStatus) && size(self.originStatus) > 0 && has(self.upstreamStatus) && size(self.upstreamStatus) > 0)",message="originStatus and upstreamStatus are mutually exclusive"
 type RedirectWhen struct {
-	// +required
-	Path RedirectPathMatch `json:"path"`
+	// +optional
+	Path *RedirectPathMatch `json:"path,omitempty"`
 
 	// +kubebuilder:validation:MaxItems=32
 	// +optional
@@ -439,7 +439,7 @@ type RedirectPathMatch struct {
 	Type string `json:"type"`
 
 	// +kubebuilder:validation:MaxLength=512
-	// +kubebuilder:validation:Pattern=`^/[^\r\n\x00]*$`
+	// +kubebuilder:validation:Pattern=`^/[A-Za-z0-9._~/%:@+*,=-]*$`
 	// +required
 	Value string `json:"value"`
 }

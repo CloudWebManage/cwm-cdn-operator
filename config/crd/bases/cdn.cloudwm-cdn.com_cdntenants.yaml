@@ -76,7 +76,7 @@ spec:
                 description: CacheConfig defines tenant CDN cache behavior.
                 properties:
                   edgeTtl:
-                    pattern: ^[0-9]+(ns|us|µs|ms|s|m|h)$
+                    pattern: ^[0-9]+(s|m|h|d)$
                     type: string
                   enabled:
                     type: boolean
@@ -93,7 +93,7 @@ spec:
                 description: CaptchaConfig defines tenant captcha settings.
                 properties:
                   cookieTtl:
-                    pattern: ^[0-9]+(ns|us|µs|ms|s|m|h)$
+                    pattern: ^[0-9]+(s|m|h|d)$
                     type: string
                   enabled:
                     type: boolean
@@ -108,7 +108,7 @@ spec:
                           properties:
                             path:
                               maxLength: 512
-                              pattern: ^/[^\r\n\x00]*$
+                              pattern: ^/[A-Za-z0-9._~/%:@+*,=-]*$
                               type: string
                             type:
                               enum:
@@ -140,6 +140,10 @@ spec:
                   siteKey:
                     type: string
                 type: object
+                x-kubernetes-validations:
+                - message: captcha.rules require captcha.enabled=true
+                  rule: '!has(self.rules) || size(self.rules) == 0 || (has(self.enabled)
+                    && self.enabled)'
               config:
                 additionalProperties:
                   type: string
@@ -312,7 +316,7 @@ spec:
                               type: string
                             value:
                               maxLength: 512
-                              pattern: ^/[^\r\n\x00]*$
+                              pattern: ^/[A-Za-z0-9._~/%:@+*,=-]*$
                               type: string
                           required:
                           - type
@@ -325,14 +329,7 @@ spec:
                             type: integer
                           maxItems: 32
                           type: array
-                      required:
-                      - path
                       type: object
-                      x-kubernetes-validations:
-                      - message: originStatus and upstreamStatus are mutually exclusive
-                        rule: '!(has(self.originStatus) && size(self.originStatus)
-                          > 0 && has(self.upstreamStatus) && size(self.upstreamStatus)
-                          > 0)'
                   required:
                   - name
                   - to
@@ -360,29 +357,15 @@ spec:
                     properties:
                       allow:
                         items:
-                          enum:
-                          - GET
-                          - HEAD
-                          - POST
-                          - PUT
-                          - PATCH
-                          - DELETE
-                          - OPTIONS
+                          pattern: ^[A-Z]+$
                           type: string
-                        maxItems: 16
+                        maxItems: 32
                         type: array
                       block:
                         items:
-                          enum:
-                          - GET
-                          - HEAD
-                          - POST
-                          - PUT
-                          - PATCH
-                          - DELETE
-                          - OPTIONS
+                          pattern: ^[A-Z]+$
                           type: string
-                        maxItems: 16
+                        maxItems: 32
                         type: array
                     type: object
                   rateLimit:
@@ -402,7 +385,7 @@ spec:
                         - clientIp
                         type: string
                       period:
-                        pattern: ^[0-9]+(ns|us|µs|ms|s|m|h)$
+                        pattern: ^[0-9]+(s|m|h|d)$
                         type: string
                       requests:
                         minimum: 1
@@ -424,7 +407,7 @@ spec:
                               properties:
                                 path:
                                   maxLength: 512
-                                  pattern: ^/[^\r\n\x00]*$
+                                  pattern: ^/[A-Za-z0-9._~/%:@+*,=-]*$
                                   type: string
                                 type:
                                   enum:

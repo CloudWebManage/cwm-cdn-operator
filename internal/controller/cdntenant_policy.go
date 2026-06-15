@@ -8,6 +8,7 @@ import (
 	stdjson "encoding/json"
 	"fmt"
 	"net"
+	neturl "net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -32,11 +33,18 @@ const (
 	signingKeySecretName      = "tenant-policy-signing-key"
 	signingKeySecretKey       = "signing-key"
 	signingKeySecretMountPath = "/etc/cwm-cdn/signing-key"
-	trustedClientIPEnv        = "CWM_CDN_TRUSTED_CLIENT_IP_ENABLED"
 	maxRequestBodySizeBytes   = int64(1024 * 1024 * 1024)
+	maxPolicyRules            = 100
+	maxPolicyMethods          = 32
 )
 
-var headerFieldNamePattern = regexp.MustCompile(`^[!#$%&'*+.^_` + "`" + `|~0-9A-Za-z-]+$`)
+var (
+	headerFieldNamePattern = regexp.MustCompile(`^[!#$%&'*+.^_` + "`" + `|~0-9A-Za-z-]+$`)
+	policyDurationPattern  = regexp.MustCompile(`^(\d+)(s|m|h|d)$`)
+	methodPattern          = regexp.MustCompile(`^[A-Z]+$`)
+	globPathPattern        = regexp.MustCompile(`^/[A-Za-z0-9._~/%:@+*,=-]*$`)
+	redirectTargetPattern  = regexp.MustCompile(`^(?:/[A-Za-z0-9._~!&'()*+,=:@/%?-]*|https?://[A-Za-z0-9._~!&'()*+,=:@/%?-]+)$`)
+)
 
 type effectiveCacheConfig struct {
 	Enabled                   bool   `json:"enabled"`
@@ -67,16 +75,19 @@ func effectiveCache(cache *cdnv1.CacheConfig) (effectiveCacheConfig, error) {
 		return effective, fmt.Errorf("cache.mode must be cache_everything")
 	}
 	if cache.EdgeTtl != "" {
-		ttl, err := time.ParseDuration(cache.EdgeTtl)
+		ttlSeconds, err := parsePolicyDurationSeconds(cache.EdgeTtl, 1, 30*24*60*60)
 		if err != nil {
 			return effective, fmt.Errorf("cache.edgeTtl is invalid: %w", err)
 		}
-		if ttl < time.Second || ttl > 30*24*time.Hour {
-			return effective, fmt.Errorf("cache.edgeTtl must be between 1s and 30d")
+		if ttlSeconds != int64(time.Hour/time.Second) {
+			return effective, fmt.Errorf("cache.edgeTtl values other than 1h require cache-layer dynamic TTL support")
 		}
-		effective.EdgeTTLSeconds = int64(ttl / time.Second)
+		effective.EdgeTTLSeconds = ttlSeconds
 	}
 	if cache.RespectOriginCacheControl != nil {
+		if !*cache.RespectOriginCacheControl {
+			return effective, fmt.Errorf("cache.respectOriginCacheControl=false requires cache-layer origin-header override support")
+		}
 		effective.RespectOriginCacheControl = *cache.RespectOriginCacheControl
 	}
 	if cache.StatusHeader != nil {
@@ -93,7 +104,7 @@ func validCacheStatusHeader(name string) bool {
 		return false
 	}
 	switch strings.ToLower(name) {
-	case "authorization", "cookie", "set-cookie", "host", "connection", "upgrade", "keep-alive", "transfer-encoding", "te", "trailer", "proxy-authenticate", "proxy-authorization":
+	case "authorization", "cookie", "set-cookie", "host", "connection", "upgrade", "keep-alive", "transfer-encoding", "te", "trailer", "proxy-authenticate", "proxy-authorization", "x-cwmcdn-tenant-name", "x-cwmcdn-cache-enabled", "x-cwmcdn-cache-edge-ttl-seconds", "x-cwmcdn-cache-respect-origin-cache-control", "x-cwmcdn-cache-status-header":
 		return false
 	default:
 		return true
@@ -120,10 +131,16 @@ func protectedTenantConfigEnvNames() map[string]struct{} {
 		"CACHE_RESPECT_ORIGIN_CACHE_CONTROL": {},
 		"CACHE_STATUS_HEADER":                {},
 		"CDN_POLICY_FILE":                    {},
+		"CWM_CDN_POLICY_PATH":                {},
+		"TENANT_POLICY_JSON":                 {},
 		"CAPTCHA_SECRET_PATH":                {},
 		"CAPTCHA_SIGNING_KEY_PATH":           {},
 		"POP_ID":                             {},
+		"CWM_CDN_POP_ID":                     {},
 		"ENABLE_PLATFORM_LOGS":               {},
+		"ENABLE_TENANT_ACCESS_LOGS":          {},
+		"ENABLE_ES_SINK":                     {},
+		"CDN_CACHE_ROUTER":                   {},
 	}
 }
 
@@ -132,8 +149,41 @@ func envNameProtected(name string) bool {
 	return ok
 }
 
-func trustedClientIPConfigured() bool {
-	return strings.EqualFold(os.Getenv(trustedClientIPEnv), "true")
+func trustedClientIPEnabled() bool {
+	value := strings.ToLower(os.Getenv("CWM_CDN_TRUSTED_CLIENT_IP_ENABLED"))
+	return value == "1" || value == "true" || value == "yes"
+}
+
+func validateTenantConfigMaps(tenant *cdnv1.CdnTenant) []string {
+	var errs []string
+	legacyAllowedConfig := map[string]struct{}{
+		"IMAGE":    {},
+		"REPLICAS": {},
+	}
+	for key := range tenant.Spec.Config {
+		upperKey := strings.ToUpper(key)
+		_, legacyAllowed := legacyAllowedConfig[upperKey]
+		if envNameProtected(key) && !legacyAllowed {
+			errs = append(errs, fmt.Sprintf("spec.config.%s is platform-managed and must not be set by tenants", key))
+		}
+	}
+	domainReserved := map[string]struct{}{"NAME": {}, "CERT": {}, "KEY": {}, "TLS_MODE": {}, "TLS_MIN_VERSION": {}, "TLS_MAX_VERSION": {}, "REDIRECT_HTTP_TO_HTTPS": {}, "CERT_PATH": {}, "KEY_PATH": {}}
+	for i, domain := range tenant.Spec.Domains {
+		for key := range domain.Config {
+			if _, ok := domainReserved[strings.ToUpper(key)]; ok {
+				errs = append(errs, fmt.Sprintf("domains[%d].config.%s conflicts with platform-managed domain config", i, key))
+			}
+		}
+	}
+	originReserved := map[string]struct{}{"URL": {}, "NAME": {}, "WEIGHT": {}, "HEALTHCHECK_ENABLED": {}, "HEALTHCHECK_PATH": {}, "HEALTHCHECK_EXPECTEDSTATUS": {}, "HEALTHCHECK_INTERVAL": {}, "HEALTHCHECK_TIMEOUT": {}, "HEALTHCHECK_HEALTHYTHRESHOLD": {}, "HEALTHCHECK_UNHEALTHYTHRESHOLD": {}}
+	for i, origin := range tenant.Spec.Origins {
+		for key := range origin.Config {
+			if _, ok := originReserved[strings.ToUpper(key)]; ok {
+				errs = append(errs, fmt.Sprintf("origins[%d].config.%s conflicts with platform-managed origin config", i, key))
+			}
+		}
+	}
+	return errs
 }
 
 func captchaRequired(tenant *cdnv1.CdnTenant) bool {
@@ -148,15 +198,22 @@ func validateTenantPolicy(ctx context.Context, c client.Client, tenant *cdnv1.Cd
 	if _, err := effectiveCache(tenant.Spec.Cache); err != nil {
 		errs = append(errs, err.Error())
 	}
+	errs = append(errs, validateTenantConfigMaps(tenant)...)
 	if sec := tenant.Spec.Security; sec != nil {
-		if sec.IPAccess != nil && (len(sec.IPAccess.AllowCidrs) > 0 || len(sec.IPAccess.BlockCidrs) > 0) && !trustedClientIPConfigured() {
-			errs = append(errs, "security.ipAccess requires trusted client IP support")
-		}
 		if sec.IPAccess != nil {
+			if (len(sec.IPAccess.AllowCidrs) > 0 || len(sec.IPAccess.BlockCidrs) > 0) && !trustedClientIPEnabled() {
+				errs = append(errs, "security.ipAccess requires trusted client IP support to be enabled")
+			}
 			for _, cidr := range append(append([]string{}, sec.IPAccess.AllowCidrs...), sec.IPAccess.BlockCidrs...) {
 				if _, _, err := net.ParseCIDR(cidr); err != nil {
 					errs = append(errs, fmt.Sprintf("security.ipAccess CIDR %q is invalid", cidr))
 				}
+			}
+			if len(sec.IPAccess.AllowCidrs) > maxPolicyRules {
+				errs = append(errs, fmt.Sprintf("security.ipAccess.allowCidrs may contain at most %d CIDRs", maxPolicyRules))
+			}
+			if len(sec.IPAccess.BlockCidrs) > maxPolicyRules {
+				errs = append(errs, fmt.Sprintf("security.ipAccess.blockCidrs may contain at most %d CIDRs", maxPolicyRules))
 			}
 		}
 		if sec.URLs != nil {
@@ -166,16 +223,27 @@ func validateTenantPolicy(ctx context.Context, c client.Client, tenant *cdnv1.Cd
 			errs = append(errs, validateMethods(sec.Methods)...)
 		}
 		if sec.RateLimit != nil && sec.RateLimit.Enabled {
-			if (sec.RateLimit.Key == "" || sec.RateLimit.Key == "clientIp") && !trustedClientIPConfigured() {
-				errs = append(errs, "security.rateLimit key clientIp requires trusted client IP support")
+			if sec.RateLimit.Requests < 1 {
+				errs = append(errs, "security.rateLimit.requests must be a positive integer")
+			}
+			if sec.RateLimit.Key != "" && sec.RateLimit.Key != "clientIp" {
+				errs = append(errs, "security.rateLimit.key must be clientIp")
+			}
+			if !trustedClientIPEnabled() {
+				errs = append(errs, "security.rateLimit.key=clientIp requires trusted client IP support to be enabled")
 			}
 			if sec.RateLimit.Period != "" {
-				if _, err := time.ParseDuration(sec.RateLimit.Period); err != nil {
+				if _, err := parsePolicyDurationSeconds(sec.RateLimit.Period, 1, 3600); err != nil {
 					errs = append(errs, fmt.Sprintf("security.rateLimit.period is invalid: %v", err))
 				}
 			}
-			if sec.RateLimit.Action == "captcha" && (tenant.Spec.Captcha == nil || !tenant.Spec.Captcha.Enabled) {
-				errs = append(errs, "security.rateLimit.action captcha requires captcha.enabled=true")
+			if sec.RateLimit.Action == "captcha" {
+				if tenant.Spec.Captcha == nil || !tenant.Spec.Captcha.Enabled {
+					errs = append(errs, "security.rateLimit.action=captcha requires captcha.enabled=true")
+				}
+			}
+			if sec.RateLimit.Action != "" && sec.RateLimit.Action != "block" && sec.RateLimit.Action != "captcha" {
+				errs = append(errs, "security.rateLimit.action must be block or captcha")
 			}
 		}
 		if sec.Request != nil && sec.Request.MaxBodySize != "" {
@@ -186,8 +254,8 @@ func validateTenantPolicy(ctx context.Context, c client.Client, tenant *cdnv1.Cd
 	}
 	if captcha := tenant.Spec.Captcha; captcha != nil {
 		errs = append(errs, validateNamedPathRules("captcha.rules", captcha.Rules)...)
-		if captcha.CookieTtl != "" {
-			errs = append(errs, validateDurationBounds("captcha.cookieTtl", captcha.CookieTtl, time.Minute, 24*time.Hour)...)
+		if len(captcha.Rules) > 0 && !captcha.Enabled {
+			errs = append(errs, "captcha.rules require captcha.enabled=true")
 		}
 		if captcha.Enabled {
 			if captcha.Provider != "turnstile" {
@@ -201,6 +269,11 @@ func validateTenantPolicy(ctx context.Context, c client.Client, tenant *cdnv1.Cd
 			} else if err := secretKeyExists(ctx, c, tenant.Name, captcha.SecretRef.Name, captcha.SecretRef.Key); err != nil {
 				errs = append(errs, fmt.Sprintf("captcha.secretRef is not ready: %v", err))
 			}
+			if captcha.CookieTtl != "" {
+				if _, err := parsePolicyDurationSeconds(captcha.CookieTtl, 1, 24*60*60); err != nil {
+					errs = append(errs, fmt.Sprintf("captcha.cookieTtl is invalid: %v", err))
+				}
+			}
 		}
 	}
 	errs = append(errs, validateRedirects(tenant.Spec.Redirects)...)
@@ -209,6 +282,9 @@ func validateTenantPolicy(ctx context.Context, c client.Client, tenant *cdnv1.Cd
 
 func validateNamedPathRules(field string, rules []cdnv1.NamedPathRule) []string {
 	var errs []string
+	if len(rules) > maxPolicyRules {
+		errs = append(errs, fmt.Sprintf("%s may contain at most %d rules", field, maxPolicyRules))
+	}
 	seen := map[string]struct{}{}
 	for _, rule := range rules {
 		if rule.Name == "" {
@@ -230,13 +306,16 @@ func validateNamedPathRules(field string, rules []cdnv1.NamedPathRule) []string 
 
 func validateMethods(methods *cdnv1.MethodsConfig) []string {
 	var errs []string
-	allowedMethods := map[cdnv1.HTTPMethod]struct{}{
-		"GET": {}, "HEAD": {}, "POST": {}, "PUT": {}, "PATCH": {}, "DELETE": {}, "OPTIONS": {},
+	if len(methods.Allow) > maxPolicyMethods {
+		errs = append(errs, fmt.Sprintf("security.methods.allow may contain at most %d methods", maxPolicyMethods))
+	}
+	if len(methods.Block) > maxPolicyMethods {
+		errs = append(errs, fmt.Sprintf("security.methods.block may contain at most %d methods", maxPolicyMethods))
 	}
 	allowSeen := map[cdnv1.HTTPMethod]struct{}{}
 	for _, method := range methods.Allow {
-		if _, ok := allowedMethods[method]; !ok {
-			errs = append(errs, fmt.Sprintf("security.methods.allow contains unsupported method %q", method))
+		if !methodPattern.MatchString(string(method)) {
+			errs = append(errs, fmt.Sprintf("security.methods.allow contains invalid HTTP method %q", method))
 		}
 		if _, ok := allowSeen[method]; ok {
 			errs = append(errs, fmt.Sprintf("security.methods.allow contains duplicate method %q", method))
@@ -245,8 +324,8 @@ func validateMethods(methods *cdnv1.MethodsConfig) []string {
 	}
 	blockSeen := map[cdnv1.HTTPMethod]struct{}{}
 	for _, method := range methods.Block {
-		if _, ok := allowedMethods[method]; !ok {
-			errs = append(errs, fmt.Sprintf("security.methods.block contains unsupported method %q", method))
+		if !methodPattern.MatchString(string(method)) {
+			errs = append(errs, fmt.Sprintf("security.methods.block contains invalid HTTP method %q", method))
 		}
 		if _, ok := blockSeen[method]; ok {
 			errs = append(errs, fmt.Sprintf("security.methods.block contains duplicate method %q", method))
@@ -272,21 +351,47 @@ func validateGlobPath(path string) error {
 	if strings.Contains(path, "\\") {
 		return fmt.Errorf("must not contain backslashes")
 	}
-	if strings.Contains(path, "/../") || strings.HasSuffix(path, "/..") {
+	if !globPathPattern.MatchString(path) {
+		return fmt.Errorf("contains unsafe characters")
+	}
+	if strings.Contains(path, "/../") || strings.HasSuffix(path, "/..") || strings.Contains(path, "/./") || strings.HasSuffix(path, "/.") {
 		return fmt.Errorf("must not contain path traversal segments")
+	}
+	lowerPath := strings.ToLower(path)
+	if strings.Contains(lowerPath, "%2e") || strings.Contains(lowerPath, "%2f") || strings.Contains(lowerPath, "%5c") {
+		return fmt.Errorf("must not contain encoded path traversal characters")
 	}
 	return nil
 }
 
-func validateDurationBounds(field, value string, min, max time.Duration) []string {
-	duration, err := time.ParseDuration(value)
-	if err != nil {
-		return []string{fmt.Sprintf("%s is invalid: %v", field, err)}
+func parsePolicyDurationSeconds(value string, minSeconds, maxSeconds int64) (int64, error) {
+	match := policyDurationPattern.FindStringSubmatch(value)
+	if match == nil {
+		return 0, fmt.Errorf("must use s, m, h, or d duration syntax")
 	}
-	if duration < min || duration > max {
-		return []string{fmt.Sprintf("%s must be between %s and %s", field, min, max)}
+	amount, err := strconv.ParseInt(match[1], 10, 64)
+	if err != nil || amount <= 0 {
+		return 0, fmt.Errorf("must be a positive duration")
 	}
-	return nil
+	multiplier := int64(1)
+	switch match[2] {
+	case "s":
+		multiplier = 1
+	case "m":
+		multiplier = 60
+	case "h":
+		multiplier = 3600
+	case "d":
+		multiplier = 86400
+	}
+	if amount > maxSeconds/multiplier {
+		return 0, fmt.Errorf("must be between %ds and %ds", minSeconds, maxSeconds)
+	}
+	seconds := amount * multiplier
+	if seconds < minSeconds || seconds > maxSeconds {
+		return 0, fmt.Errorf("must be between %ds and %ds", minSeconds, maxSeconds)
+	}
+	return seconds, nil
 }
 
 func parseMaxBodySize(value string) (int64, error) {
@@ -310,6 +415,9 @@ func parseMaxBodySize(value string) (int64, error) {
 	if err != nil || parsed <= 0 {
 		return 0, fmt.Errorf("must be a positive integer optionally suffixed with k, m, or g")
 	}
+	if parsed > maxRequestBodySizeBytes/multiplier {
+		return 0, fmt.Errorf("must be between 1 byte and 1Gi")
+	}
 	bytes := parsed * multiplier
 	if bytes <= 0 || bytes > maxRequestBodySizeBytes {
 		return 0, fmt.Errorf("must be between 1 byte and 1Gi")
@@ -319,6 +427,9 @@ func parseMaxBodySize(value string) (int64, error) {
 
 func validateRedirects(redirects []cdnv1.RedirectRule) []string {
 	var errs []string
+	if len(redirects) > maxPolicyRules {
+		errs = append(errs, fmt.Sprintf("redirects may contain at most %d rules", maxPolicyRules))
+	}
 	seen := map[string]struct{}{}
 	for _, redirect := range redirects {
 		if redirect.Name == "" {
@@ -328,25 +439,71 @@ func validateRedirects(redirects []cdnv1.RedirectRule) []string {
 			errs = append(errs, fmt.Sprintf("redirect name %q is duplicated", redirect.Name))
 		}
 		seen[redirect.Name] = struct{}{}
-		if redirect.When.Path.Type != "glob" {
-			errs = append(errs, fmt.Sprintf("redirect %q when.path.type must be glob", redirect.Name))
+		hasPath := redirect.When.Path != nil && (redirect.When.Path.Type != "" || redirect.When.Path.Value != "")
+		hasOriginStatus := len(redirect.When.OriginStatus) > 0
+		hasUpstreamStatus := len(redirect.When.UpstreamStatus) > 0
+		if !hasPath && !hasOriginStatus && !hasUpstreamStatus {
+			errs = append(errs, fmt.Sprintf("redirect %q requires at least one matcher", redirect.Name))
 		}
-		if err := validateGlobPath(redirect.When.Path.Value); err != nil {
-			errs = append(errs, fmt.Sprintf("redirect %q when.path.value is invalid: %v", redirect.Name, err))
-		}
-		if len(redirect.To) > 512 || strings.ContainsAny(redirect.To, "\r\n") || !(strings.HasPrefix(redirect.To, "/") || strings.HasPrefix(redirect.To, "http://") || strings.HasPrefix(redirect.To, "https://")) {
-			errs = append(errs, fmt.Sprintf("redirect %q to must be a relative path or http/https URL without CR/LF", redirect.Name))
-		}
-		if len(redirect.When.OriginStatus) > 0 && len(redirect.When.UpstreamStatus) > 0 {
+		if hasOriginStatus && hasUpstreamStatus {
 			errs = append(errs, fmt.Sprintf("redirect %q originStatus and upstreamStatus are mutually exclusive", redirect.Name))
+		}
+		if hasPath {
+			if redirect.When.Path.Type != "glob" {
+				errs = append(errs, fmt.Sprintf("redirect %q when.path.type must be glob", redirect.Name))
+			}
+			if err := validateGlobPath(redirect.When.Path.Value); err != nil {
+				errs = append(errs, fmt.Sprintf("redirect %q when.path.value is invalid: %v", redirect.Name, err))
+			}
+		}
+		if err := validateRedirectTarget(redirect.To); err != nil {
+			errs = append(errs, fmt.Sprintf("redirect %q to is invalid: %v", redirect.Name, err))
 		}
 		errs = append(errs, validateHTTPStatuses(fmt.Sprintf("redirect %q originStatus", redirect.Name), redirect.When.OriginStatus)...)
 		errs = append(errs, validateHTTPStatuses(fmt.Sprintf("redirect %q upstreamStatus", redirect.Name), redirect.When.UpstreamStatus)...)
+		if hasPath && !strings.Contains(redirect.When.Path.Value, "*") && strings.SplitN(redirect.To, "?", 2)[0] == redirect.When.Path.Value {
+			errs = append(errs, fmt.Sprintf("redirect %q direct self-redirects are not allowed", redirect.Name))
+		}
 		if redirect.Status != 0 && redirect.Status != 301 && redirect.Status != 302 && redirect.Status != 307 && redirect.Status != 308 {
 			errs = append(errs, fmt.Sprintf("redirect %q status must be one of 301, 302, 307, 308", redirect.Name))
 		}
 	}
 	return errs
+}
+
+func validateRedirectTarget(target string) error {
+	if target == "" || len(target) > 512 {
+		return fmt.Errorf("must be 1-512 characters")
+	}
+	if strings.ContainsAny(target, "\r\n\x00") {
+		return fmt.Errorf("must not contain control characters")
+	}
+	if strings.Contains(target, "\\") {
+		return fmt.Errorf("must not contain backslashes")
+	}
+	if !redirectTargetPattern.MatchString(target) || strings.ContainsAny(target, " $;{}") {
+		return fmt.Errorf("must be a safe relative /... or absolute http(s) URL")
+	}
+	if strings.HasPrefix(target, "/") {
+		if strings.HasPrefix(target, "//") {
+			return fmt.Errorf("relative paths must not start with //")
+		}
+		return nil
+	}
+	parsed, err := neturl.Parse(target)
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("must be a relative path or absolute http/https URL")
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("absolute URLs must include a host")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("absolute URLs must not include user info")
+	}
+	return nil
 }
 
 func validateHTTPStatuses(field string, statuses []cdnv1.HTTPStatusCode) []string {
