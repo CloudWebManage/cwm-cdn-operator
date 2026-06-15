@@ -590,6 +590,17 @@ func (r *CdnTenantReconciler) updateDomainTLSStatus(ctx context.Context, req ctr
 	return r.Status().Update(ctx, tenant)
 }
 
+func (r *CdnTenantReconciler) updateSecondarySyncStatus(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, statuses []cdnv1.SecondarySyncStatus) error {
+	if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
+		return err
+	}
+	if equality.Semantic.DeepEqual(tenant.Status.SecondarySync, statuses) {
+		return nil
+	}
+	tenant.Status.SecondarySync = statuses
+	return r.Status().Update(ctx, tenant)
+}
+
 func cloneTenantSpec(spec cdnv1.CdnTenantSpec) (cdnv1.CdnTenantSpec, error) {
 	b, err := json.Marshal(spec)
 	if err != nil {
@@ -646,6 +657,28 @@ func (r *CdnTenantReconciler) secondaryTenantSpec(ctx context.Context, tenant *c
 		spec.Domains[i].TLS.Mode = "provided"
 	}
 	return spec, nil
+}
+
+func (r *CdnTenantReconciler) failClosedTenantDeployment(ctx context.Context, tenant *cdnv1.CdnTenant, message string) error {
+	deployment := &appsv1.Deployment{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "tenant", Namespace: tenant.Name}, deployment); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if deployment.Annotations == nil {
+		deployment.Annotations = map[string]string{}
+	}
+	deployment.Annotations[tenantAnnotationKey] = fmt.Sprintf("%s/%s", tenant.Namespace, tenant.Name)
+	deployment.Annotations["cdn.cloudwm-cdn.com/policy-validation"] = "failed"
+	if deployment.Spec.Template.Annotations == nil {
+		deployment.Spec.Template.Annotations = map[string]string{}
+	}
+	messageHash := sha256.Sum256([]byte(message))
+	deployment.Spec.Template.Annotations["cdn.cloudwm-cdn.com/invalid-policy-hash"] = hex.EncodeToString(messageHash[:])
+	deployment.Spec.Replicas = ptr.To(int32(0))
+	return r.Update(ctx, deployment)
 }
 
 func (r *CdnTenantReconciler) getTenantSpecConfig(tenant *cdnv1.CdnTenant, configKey string, defaultValue string) string {
@@ -892,6 +925,7 @@ func originHealthEnvVars(index int, healthCheck *cdnv1.OriginHealthCheck) []core
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
@@ -952,6 +986,73 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", fmt.Sprintf("Namespace %s", opres))
 		}
 		log.V(1).Info("Reconciled Namespace", "opres", opres)
+		policyErrors := validateTenantPolicy(ctx, r.Client, tenant)
+		if len(policyErrors) > 0 {
+			message := strings.Join(policyErrors, "; ")
+			log.Info("Tenant policy validation failed", "error", message)
+			if err := r.failClosedTenantDeployment(ctx, tenant, message); err != nil {
+				return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonPolicyValidationFailed, "Failed to fail closed tenant deployment")
+			}
+			if err := r.setErrorConditions(ctx, req, tenant, cdnv1.ReasonPolicyValidationFailed, message); err != nil {
+				return ctrl.Result{}, err
+			}
+			r.Recorder.Event(tenant, corev1.EventTypeWarning, cdnv1.ReasonPolicyValidationFailed, message)
+			requeueAfter, err := r.syncInvalidPolicySecondaries(req, ctx, tenant)
+			if err != nil {
+				return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonSyncFailed, "Failed to sync invalid policy to secondaries")
+			}
+			if requeueAfter > 0 {
+				return ctrl.Result{RequeueAfter: requeueAfter}, nil
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		cacheConfig, err := effectiveCache(tenant.Spec.Cache)
+		if err != nil {
+			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonPolicyValidationFailed, "Failed to calculate effective cache config")
+		}
+		if captchaRequired(tenant) {
+			if err := ensureSigningKeySecret(ctx, r.Client, tenant); err != nil {
+				return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonPolicyValidationFailed, "Failed to reconcile policy signing key Secret")
+			}
+		}
+		policyJSON, policyHash, err := buildPolicyJSON(tenant, cacheConfig)
+		if err != nil {
+			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonPolicyValidationFailed, "Failed to render tenant policy")
+		}
+		captchaSecretHash := ""
+		if tenant.Spec.Captcha != nil && tenant.Spec.Captcha.Enabled && tenant.Spec.Captcha.SecretRef != nil {
+			captchaSecretHash, err = secretRolloutHash(ctx, r.Client, tenant.Name, tenant.Spec.Captcha.SecretRef.Name, tenant.Spec.Captcha.SecretRef.Key)
+			if err != nil {
+				return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonPolicyValidationFailed, "Failed to calculate captcha Secret rollout hash")
+			}
+		}
+		signingKeyHash := ""
+		if captchaRequired(tenant) {
+			signingKeyHash, err = secretRolloutHash(ctx, r.Client, tenant.Name, signingKeySecretName, signingKeySecretKey)
+			if err != nil {
+				return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonPolicyValidationFailed, "Failed to calculate signing-key Secret rollout hash")
+			}
+		}
+		policyConfigMap := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: policyConfigMapName, Namespace: tenant.Name}}
+		opres, err = controllerutil.CreateOrUpdate(ctx, r.Client, policyConfigMap, func() error {
+			if policyConfigMap.Annotations == nil {
+				policyConfigMap.Annotations = map[string]string{}
+			}
+			policyConfigMap.Annotations[tenantAnnotationKey] = fmt.Sprintf("%s/%s", tenant.Namespace, tenant.Name)
+			if policyConfigMap.Labels == nil {
+				policyConfigMap.Labels = map[string]string{}
+			}
+			policyConfigMap.Labels["cdn.cloudwm-cdn.com/tenant"] = tenant.Name
+			policyConfigMap.Data = map[string]string{policyConfigMapKey: policyJSON}
+			return nil
+		})
+		if err != nil {
+			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonPolicyValidationFailed, "Failed to reconcile tenant policy ConfigMap")
+		}
+		if opres != controllerutil.OperationResultNone {
+			hasUpdates = true
+			r.Recorder.Event(tenant, corev1.EventTypeNormal, "Reconciling", fmt.Sprintf("Policy ConfigMap %s", opres))
+		}
 		domainTLSStatuses, err := r.reconcileDomainTLSResources(ctx, tenant)
 		if err != nil {
 			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonReconcileFailed, "Failed to reconcile domain TLS resources")
@@ -986,6 +1087,23 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			if !tenantAutoscalingEnabled(tenant) {
 				deployment.Spec.Replicas = ptr.To(int32(r.getTenantSpecConfigInt(tenant, "REPLICAS", defaultReplicas)))
 			}
+			if deployment.Spec.Template.Annotations == nil {
+				deployment.Spec.Template.Annotations = map[string]string{}
+			}
+			deployment.Spec.Template.Annotations["cdn.cloudwm-cdn.com/policy-hash"] = policyHash
+			if captchaSecretHash != "" {
+				deployment.Spec.Template.Annotations["cdn.cloudwm-cdn.com/captcha-secret-rollout-hash"] = captchaSecretHash
+			} else {
+				delete(deployment.Spec.Template.Annotations, "cdn.cloudwm-cdn.com/captcha-secret-rollout-hash")
+			}
+			if signingKeyHash != "" {
+				deployment.Spec.Template.Annotations["cdn.cloudwm-cdn.com/signing-key-rollout-hash"] = signingKeyHash
+			} else {
+				delete(deployment.Spec.Template.Annotations, "cdn.cloudwm-cdn.com/signing-key-rollout-hash")
+			}
+			delete(deployment.Spec.Template.Annotations, "cdn.cloudwm-cdn.com/captcha-secret-ref-hash")
+			delete(deployment.Spec.Template.Annotations, "cdn.cloudwm-cdn.com/signing-key-secret")
+			deployment.Spec.Replicas = ptr.To(int32(r.getTenantSpecConfigInt(tenant, "REPLICAS", defaultReplicas)))
 			ps := &deployment.Spec.Template.Spec
 			tolerations := []corev1.Toleration{{Key: "cwm-iac-worker-role", Operator: corev1.TolerationOpEqual, Value: "cdn", Effect: corev1.TaintEffectNoExecute}}
 			if !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.Tolerations, tolerations) {
@@ -1016,6 +1134,20 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 					Name:  "TENANT_NAME",
 					Value: tenant.Name,
 				},
+			}
+			env = appendCacheEnv(env, cacheConfig)
+			env = append(env, corev1.EnvVar{Name: "CDN_POLICY_FILE", Value: policyFilePath})
+			if popID := r.getTenantSpecConfig(tenant, "POP_ID", ""); popID != "" {
+				env = append(env, corev1.EnvVar{Name: "POP_ID", Value: popID})
+			}
+			if enablePlatformLogs := r.getTenantSpecConfig(tenant, "ENABLE_PLATFORM_LOGS", ""); enablePlatformLogs != "" {
+				env = append(env, corev1.EnvVar{Name: "ENABLE_PLATFORM_LOGS", Value: enablePlatformLogs})
+			}
+			if tenant.Spec.Captcha != nil && tenant.Spec.Captcha.Enabled && tenant.Spec.Captcha.SecretRef != nil {
+				env = append(env, corev1.EnvVar{Name: "CAPTCHA_SECRET_PATH", Value: fmt.Sprintf("%s/%s", captchaSecretMountPath, tenant.Spec.Captcha.SecretRef.Key)})
+			}
+			if captchaRequired(tenant) {
+				env = append(env, corev1.EnvVar{Name: "CAPTCHA_SIGNING_KEY_PATH", Value: fmt.Sprintf("%s/%s", signingKeySecretMountPath, signingKeySecretKey)})
 			}
 			for i, domain := range tenant.Spec.Domains {
 				env = append(env, corev1.EnvVar{
@@ -1105,7 +1237,7 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				}
 			}
 			for k, v := range tenant.Spec.Config {
-				if !strings.Contains("IMAGE,REPLICAS", k) {
+				if !envNameProtected(k) {
 					env = append(env, corev1.EnvVar{
 						Name:  strings.ToUpper(k),
 						Value: v,
@@ -1115,8 +1247,33 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			if !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.Containers[0].Env, env) {
 				c.Env = env
 			}
-			volumes := []corev1.Volume{}
-			volumeMounts := []corev1.VolumeMount{}
+			volumes := []corev1.Volume{
+				{
+					Name: "tenant-policy",
+					VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: policyConfigMapName},
+					}},
+				},
+			}
+			volumeMounts := []corev1.VolumeMount{{Name: "tenant-policy", MountPath: policyMountPath, ReadOnly: true}}
+			if tenant.Spec.Captcha != nil && tenant.Spec.Captcha.Enabled && tenant.Spec.Captcha.SecretRef != nil {
+				volumes = append(volumes, corev1.Volume{
+					Name: "captcha-secret",
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+						SecretName: tenant.Spec.Captcha.SecretRef.Name,
+					}},
+				})
+				volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "captcha-secret", MountPath: captchaSecretMountPath, ReadOnly: true})
+			}
+			if captchaRequired(tenant) {
+				volumes = append(volumes, corev1.Volume{
+					Name: "captcha-signing-key",
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+						SecretName: signingKeySecretName,
+					}},
+				})
+				volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "captcha-signing-key", MountPath: signingKeySecretMountPath, ReadOnly: true})
+			}
 			optionalSecret := true
 			for i, domain := range tenant.Spec.Domains {
 				if domainTLSMode(domain) != "letsencrypt" {
@@ -1137,10 +1294,6 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 					MountPath: domainCertificateMountPath(i),
 					ReadOnly:  true,
 				})
-			}
-			if len(volumes) == 0 {
-				volumes = nil
-				volumeMounts = nil
 			}
 			if !equality.Semantic.DeepEqual(ps.Volumes, volumes) {
 				ps.Volumes = volumes
@@ -1312,26 +1465,43 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 // SetupWithManager sets up the controller with the Manager.
+func (r *CdnTenantReconciler) tenantRequestsForObject(ctx context.Context, obj client.Object) []reconcile.Request {
+	ta := obj.GetAnnotations()[tenantAnnotationKey]
+	if ta != "" {
+		sp := strings.Split(ta, "/")
+		if len(sp) != 2 {
+			return nil
+		}
+		return []reconcile.Request{{
+			NamespacedName: types.NamespacedName{
+				Namespace: sp[0],
+				Name:      sp[1],
+			},
+		}}
+	}
+	secret, ok := obj.(*corev1.Secret)
+	if !ok {
+		return nil
+	}
+	var list cdnv1.CdnTenantList
+	if err := r.List(ctx, &list); err != nil {
+		return nil
+	}
+	var reqs []reconcile.Request
+	for _, tenant := range list.Items {
+		if tenant.Name != secret.Namespace {
+			continue
+		}
+		if tenant.Spec.Captcha != nil && tenant.Spec.Captcha.Enabled && tenant.Spec.Captcha.SecretRef != nil && tenant.Spec.Captcha.SecretRef.Name == secret.Name {
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: tenant.Namespace, Name: tenant.Name}})
+		}
+	}
+	return reqs
+}
+
 func (r *CdnTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Recorder = mgr.GetEventRecorderFor("tenant-controller")
-	h := handler.EnqueueRequestsFromMapFunc(
-		func(ctx context.Context, obj client.Object) []reconcile.Request {
-			ta := obj.GetAnnotations()[tenantAnnotationKey]
-			if ta == "" {
-				return nil
-			}
-			sp := strings.Split(ta, "/")
-			if len(sp) != 2 {
-				return nil
-			}
-			return []reconcile.Request{{
-				NamespacedName: types.NamespacedName{
-					Namespace: sp[0],
-					Name:      sp[1],
-				},
-			}}
-		},
-	)
+	h := handler.EnqueueRequestsFromMapFunc(r.tenantRequestsForObject)
 	configH := handler.EnqueueRequestsFromMapFunc(
 		func(ctx context.Context, obj client.Object) []reconcile.Request {
 			if obj.GetAnnotations()[configAnnotationKey] != configAnnotationValue {
@@ -1362,6 +1532,7 @@ func (r *CdnTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&cdnv1.CdnTenant{}).
 		Watches(&appsv1.Deployment{}, h).
 		Watches(&corev1.Service{}, h).
+		Watches(&corev1.ConfigMap{}, h).
 		Watches(&corev1.Secret{}, h).
 		Watches(&corev1.Secret{}, configH)
 
@@ -1380,139 +1551,175 @@ func (r *CdnTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func (r *CdnTenantReconciler) syncSecondaries(req ctrl.Request, ctx context.Context, tenant *cdnv1.CdnTenant) (time.Duration, error) {
+	tenantHash := "deleted"
+	var secondarySpec *cdnv1.CdnTenantSpec
+	if tenant.DeletionTimestamp.IsZero() {
+		spec, err := r.secondaryTenantSpec(ctx, tenant)
+		if err != nil {
+			return 0, err
+		}
+		secondarySpec = &spec
+		tenantHash, err = getTenantSpecHash(spec)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return r.syncSecondariesSpec(req, ctx, tenant, secondarySpec, tenantHash)
+}
+
+func (r *CdnTenantReconciler) syncInvalidPolicySecondaries(req ctrl.Request, ctx context.Context, tenant *cdnv1.CdnTenant) (time.Duration, error) {
+	spec, err := cloneTenantSpec(tenant.Spec)
+	if err != nil {
+		return 0, err
+	}
+	tenantHash, err := getTenantSpecHash(spec)
+	if err != nil {
+		return 0, err
+	}
+	return r.syncSecondariesSpec(req, ctx, tenant, &spec, tenantHash)
+}
+
+func (r *CdnTenantReconciler) syncSecondariesSpec(req ctrl.Request, ctx context.Context, tenant *cdnv1.CdnTenant, secondarySpec *cdnv1.CdnTenantSpec, tenantHash string) (time.Duration, error) {
 	var log = logf.FromContext(ctx)
 	var secret corev1.Secret
 	if err := r.Get(ctx, types.NamespacedName{Name: configSecretName, Namespace: tenant.Namespace}, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
 			log.V(1).Info("Config secret not found")
+			if err := r.updateSecondarySyncStatus(ctx, req, tenant, nil); err != nil {
+				return 0, err
+			}
 			return 0, nil
 		} else {
 			log.V(1).Info("Failed to get config secret")
 			return 0, err
 		}
-	} else {
-		primaryKeyBytes, ok := secret.Data["primaryKey"]
-		if !ok {
-			primaryKeyBytes = []byte("")
+	}
+	primaryKeyBytes, ok := secret.Data["primaryKey"]
+	if !ok {
+		primaryKeyBytes = []byte("")
+	}
+	primaryKey := string(primaryKeyBytes)
+	secondariesJSON, ok := secret.Data["secondaries.json"]
+	if !ok {
+		log.V(1).Info("Failed to get secondaries config")
+		if err := r.updateSecondarySyncStatus(ctx, req, tenant, nil); err != nil {
+			return 0, err
 		}
-		primaryKey := string(primaryKeyBytes)
-		secondariesJSON, ok := secret.Data["secondaries.json"]
-		if !ok {
-			log.V(1).Info("Failed to get secondaries config")
-			return 0, nil
-		} else {
-			var secondaries map[string]map[string]string
-			if err = json.Unmarshal(secondariesJSON, &secondaries); err != nil {
+		return 0, nil
+	}
+	var secondaries map[string]map[string]string
+	if err := json.Unmarshal(secondariesJSON, &secondaries); err != nil {
+		return 0, err
+	}
+	if tenant.Annotations == nil {
+		tenant.Annotations = map[string]string{}
+	}
+	updateTenantAnnotations := make(map[string]string)
+	requeueAfter := time.Duration(0)
+	statuses := make([]cdnv1.SecondarySyncStatus, 0, len(secondaries))
+	existingStatuses := make(map[string]cdnv1.SecondarySyncStatus, len(tenant.Status.SecondarySync))
+	for _, status := range tenant.Status.SecondarySync {
+		existingStatuses[status.Name] = status
+	}
+	for _, name := range stableSecondaryNames(secondaries) {
+		secondaryConfig := secondaries[name]
+		statusKey := fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)
+		hashKey := fmt.Sprintf("%s-%s-hash", secondariesAnnotationKey, name)
+		retryKey := fmt.Sprintf("%s-%s-retry", secondariesAnnotationKey, name)
+		syncStatus := tenant.Annotations[statusKey]
+		if syncStatus == "" {
+			syncStatus = "unknown"
+		}
+		syncedHash := tenant.Annotations[hashKey]
+		secondaryStatus := existingStatuses[name]
+		secondaryStatus.Name = name
+		secondaryStatus.URL = redactedSecondaryURL(secondaryConfig["url"])
+		secondaryStatus.Status = syncStatus
+		secondaryStatus.DesiredHash = tenantHash
+		secondaryStatus.SyncedHash = syncedHash
+		secondaryStatus.ObservedGeneration = tenant.Generation
+		log.V(1).Info(
+			"Checking secondary sync status",
+			"secondary", name,
+			"syncStatus", syncStatus,
+			"syncedHash", syncedHash,
+			"tenantHash", tenantHash,
+		)
+		if syncStatus == "unknown" || syncStatus == "syncing" || syncStatus == "failed" || syncedHash != tenantHash {
+			log.Info("Syncing secondary", "secondary", name, "syncStatus", syncStatus, "syncedHash", syncedHash, "tenantHash", tenantHash)
+			updateTenantAnnotations[statusKey] = "syncing"
+			if syncedHash != "" {
+				updateTenantAnnotations[hashKey] = ""
+			}
+			started := time.Now()
+			requeue, err := r.syncSecondary(ctx, tenant, secondarySpec, name, secondaryConfig, primaryKey)
+			latency := time.Since(started).Seconds()
+			attemptTime := metav1.NewTime(started)
+			secondaryStatus.LastAttemptTime = &attemptTime
+			secondaryStatus.LatencySeconds = strconv.FormatFloat(latency, 'f', 6, 64)
+			secondarySyncLatency.WithLabelValues(name).Observe(latency)
+			if err != nil {
+				secondarySyncAttempts.WithLabelValues(name, "error").Inc()
+				log.Error(err, "Failed to sync secondary", "secondary", name, "tenant", tenant.Name, "hash", tenantHash, "latencySeconds", latency)
 				return 0, err
 			}
-			updateTenantAnnotations := make(map[string]string)
-			requeueAfter := time.Duration(0)
-			var secondarySpec *cdnv1.CdnTenantSpec
-			tenantHash := "deleted"
-			if tenant.DeletionTimestamp.IsZero() {
-				spec, err := r.secondaryTenantSpec(ctx, tenant)
+			if requeue {
+				retryNum := tenant.Annotations[retryKey]
+				retryNumInt, err := strconv.Atoi(retryNum)
 				if err != nil {
-					return 0, err
+					retryNumInt = 0
 				}
-				secondarySpec = &spec
-				tenantHash, err = getTenantSpecHash(spec)
-				if err != nil {
-					return 0, err
+				if retryNumInt < 10 {
+					retryNumInt += 1
+					updateTenantAnnotations[retryKey] = fmt.Sprintf("%d", retryNumInt)
 				}
+				newRequeueAfter := time.Duration(retryNumInt*retryNumInt*2) * time.Second
+				if newRequeueAfter > requeueAfter {
+					requeueAfter = newRequeueAfter
+				}
+				secondaryStatus.Status = "failed"
+				secondaryStatus.SyncedHash = ""
+				secondaryStatus.LastError = "secondary sync request failed; retry scheduled"
+				updateTenantAnnotations[statusKey] = "failed"
+				secondarySyncAttempts.WithLabelValues(name, "failed").Inc()
+				log.Info("Secondary sync failed; will retry", "secondary", name, "tenant", tenant.Name, "hash", tenantHash, "latencySeconds", latency, "retry", retryNumInt)
+			} else {
+				secondaryStatus.Status = "synced"
+				secondaryStatus.SyncedHash = tenantHash
+				successTime := metav1.NewTime(time.Now())
+				secondaryStatus.LastSuccessTime = &successTime
+				updateTenantAnnotations[statusKey] = "synced"
+				updateTenantAnnotations[hashKey] = tenantHash
+				updateTenantAnnotations[retryKey] = "0"
+				secondarySyncAttempts.WithLabelValues(name, "synced").Inc()
+				secondarySyncStale.WithLabelValues(name).Set(0)
+				log.Info("Secondary synced successfully", "secondary", name, "tenant", tenant.Name, "hash", tenantHash, "latencySeconds", latency)
 			}
-			for name, secondaryConfig := range secondaries {
-				syncStatus, ok := tenant.Annotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)]
-				if !ok {
-					syncStatus = ""
-				}
-				syncedHash, ok := tenant.Annotations[fmt.Sprintf("%s-%s-hash", secondariesAnnotationKey, name)]
-				if !ok {
-					syncedHash = ""
-				}
-				log.V(1).Info(
-					fmt.Sprintf("Checking secondary sync status (%s)", name),
-					"secondary", name,
-					"syncStatus", syncStatus,
-					"syncedHash", syncedHash,
-					"tenantHash", tenantHash,
-				)
-				if syncStatus == "" || syncStatus == "syncing" || syncedHash != tenantHash {
-					log.Info(
-						fmt.Sprintf("Syncing secondary (%s)", name),
-						"syncStatus", syncStatus,
-						"syncedHash", syncedHash,
-						"tenantHash", tenantHash,
-					)
-					if syncStatus != "syncing" {
-						updateTenantAnnotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)] = "syncing"
-					}
-					if syncedHash != "" {
-						updateTenantAnnotations[fmt.Sprintf("%s-%s-hash", secondariesAnnotationKey, name)] = ""
-					}
-					if len(updateTenantAnnotations) > 0 {
-						if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
-							log.Error(err, "Failed to re-fetch tenant")
-							return 0, err
-						}
-						if tenant.Annotations == nil {
-							tenant.Annotations = map[string]string{}
-						}
-						for k, v := range updateTenantAnnotations {
-							tenant.Annotations[k] = v
-						}
-						if err = r.Update(ctx, tenant); err != nil {
-							return 0, err
-						}
-					}
-					updateTenantAnnotations = make(map[string]string)
-					requeue, err := r.syncSecondary(ctx, tenant, secondarySpec, name, secondaryConfig, primaryKey)
-					if err != nil {
-						log.V(1).Info(fmt.Sprintf("Failed to sync secondary (%s)", name))
-						return 0, err
-					}
-					if requeue {
-						retryNum, ok := tenant.Annotations[fmt.Sprintf("%s-%s-retry", secondariesAnnotationKey, name)]
-						if !ok {
-							retryNum = "0"
-						}
-						retryNumInt, err := strconv.Atoi(retryNum)
-						if err != nil {
-							retryNumInt = 0
-						}
-						log.V(1).Info(fmt.Sprintf("syncSecondary requeue (%s)", name), "retryNum", retryNumInt)
-						if retryNumInt < 10 {
-							retryNumInt += 1
-							updateTenantAnnotations[fmt.Sprintf("%s-%s-retry", secondariesAnnotationKey, name)] = fmt.Sprintf("%d", retryNumInt)
-						}
-						newRequeueAfter := time.Duration(retryNumInt*retryNumInt*2) * time.Second
-						if newRequeueAfter > requeueAfter {
-							requeueAfter = newRequeueAfter
-						}
-					} else {
-						log.V(1).Info(fmt.Sprintf("Secondary synced successfully (%s)", name))
-						updateTenantAnnotations[fmt.Sprintf("%s-%s-status", secondariesAnnotationKey, name)] = "synced"
-						updateTenantAnnotations[fmt.Sprintf("%s-%s-hash", secondariesAnnotationKey, name)] = tenantHash
-					}
-				}
-			}
-			if len(updateTenantAnnotations) > 0 {
-				if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
-					logf.FromContext(ctx).Error(err, "Failed to re-fetch tenant")
-					return 0, err
-				}
-				if tenant.Annotations == nil {
-					tenant.Annotations = map[string]string{}
-				}
-				for k, v := range updateTenantAnnotations {
-					tenant.Annotations[k] = v
-				}
-				if err = r.Update(ctx, tenant); err != nil {
-					return 0, err
-				}
-			}
-			return requeueAfter, nil
+		}
+		if secondaryStatus.Status == "synced" && secondaryStatus.LastSuccessTime != nil {
+			secondarySyncStale.WithLabelValues(name).Set(time.Since(secondaryStatus.LastSuccessTime.Time).Seconds())
+		}
+		statuses = append(statuses, secondaryStatus)
+	}
+	if len(updateTenantAnnotations) > 0 {
+		if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
+			log.Error(err, "Failed to re-fetch tenant")
+			return 0, err
+		}
+		if tenant.Annotations == nil {
+			tenant.Annotations = map[string]string{}
+		}
+		for k, v := range updateTenantAnnotations {
+			tenant.Annotations[k] = v
+		}
+		if err := r.Update(ctx, tenant); err != nil {
+			return 0, err
 		}
 	}
+	if err := r.updateSecondarySyncStatus(ctx, req, tenant, statuses); err != nil {
+		return 0, err
+	}
+	return requeueAfter, nil
 }
 
 func (r *CdnTenantReconciler) syncSecondary(ctx context.Context, tenant *cdnv1.CdnTenant, secondarySpec *cdnv1.CdnTenantSpec, name string, config map[string]string, primaryKey string) (bool, error) {

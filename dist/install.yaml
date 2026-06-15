@@ -80,6 +80,74 @@ spec:
                 - message: minReplicas must be less than or equal to maxReplicas when
                     autoscaling is enabled
                   rule: '!self.enabled || self.minReplicas <= self.maxReplicas'
+              cache:
+                description: CacheConfig defines tenant CDN cache behavior.
+                properties:
+                  edgeTtl:
+                    pattern: ^[0-9]+(ns|us|µs|ms|s|m|h)$
+                    type: string
+                  enabled:
+                    type: boolean
+                  mode:
+                    enum:
+                    - cache_everything
+                    type: string
+                  respectOriginCacheControl:
+                    type: boolean
+                  statusHeader:
+                    type: string
+                type: object
+              captcha:
+                description: CaptchaConfig defines tenant captcha settings.
+                properties:
+                  cookieTtl:
+                    pattern: ^[0-9]+(ns|us|µs|ms|s|m|h)$
+                    type: string
+                  enabled:
+                    type: boolean
+                  provider:
+                    enum:
+                    - turnstile
+                    type: string
+                  rules:
+                    items:
+                      properties:
+                        match:
+                          properties:
+                            path:
+                              maxLength: 512
+                              pattern: ^/[^\r\n\x00]*$
+                              type: string
+                            type:
+                              enum:
+                              - glob
+                              type: string
+                          required:
+                          - path
+                          - type
+                          type: object
+                        name:
+                          maxLength: 63
+                          type: string
+                      required:
+                      - match
+                      - name
+                      type: object
+                    maxItems: 100
+                    type: array
+                  secretRef:
+                    properties:
+                      key:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                  siteKey:
+                    type: string
+                type: object
               config:
                 additionalProperties:
                   type: string
@@ -215,6 +283,176 @@ spec:
                 - message: path-prefixed origin URLs are not supported with multiple
                     origins
                   rule: self.size() == 1 || self.all(o, !(o.url.matches('^https?://[^/]+/.+')))
+              redirects:
+                items:
+                  properties:
+                    enabled:
+                      type: boolean
+                    name:
+                      maxLength: 63
+                      type: string
+                    preserveQuery:
+                      type: boolean
+                    status:
+                      enum:
+                      - 301
+                      - 302
+                      - 307
+                      - 308
+                      type: integer
+                    to:
+                      maxLength: 512
+                      type: string
+                    when:
+                      properties:
+                        originStatus:
+                          items:
+                            maximum: 599
+                            minimum: 100
+                            type: integer
+                          maxItems: 32
+                          type: array
+                        path:
+                          properties:
+                            type:
+                              enum:
+                              - glob
+                              type: string
+                            value:
+                              maxLength: 512
+                              pattern: ^/[^\r\n\x00]*$
+                              type: string
+                          required:
+                          - type
+                          - value
+                          type: object
+                        upstreamStatus:
+                          items:
+                            maximum: 599
+                            minimum: 100
+                            type: integer
+                          maxItems: 32
+                          type: array
+                      required:
+                      - path
+                      type: object
+                      x-kubernetes-validations:
+                      - message: originStatus and upstreamStatus are mutually exclusive
+                        rule: '!(has(self.originStatus) && size(self.originStatus)
+                          > 0 && has(self.upstreamStatus) && size(self.upstreamStatus)
+                          > 0)'
+                  required:
+                  - name
+                  - to
+                  - when
+                  type: object
+                maxItems: 100
+                type: array
+              security:
+                description: SecurityConfig defines safe, typed request security controls.
+                properties:
+                  ipAccess:
+                    properties:
+                      allowCidrs:
+                        items:
+                          type: string
+                        maxItems: 100
+                        type: array
+                      blockCidrs:
+                        items:
+                          type: string
+                        maxItems: 100
+                        type: array
+                    type: object
+                  methods:
+                    properties:
+                      allow:
+                        items:
+                          enum:
+                          - GET
+                          - HEAD
+                          - POST
+                          - PUT
+                          - PATCH
+                          - DELETE
+                          - OPTIONS
+                          type: string
+                        maxItems: 16
+                        type: array
+                      block:
+                        items:
+                          enum:
+                          - GET
+                          - HEAD
+                          - POST
+                          - PUT
+                          - PATCH
+                          - DELETE
+                          - OPTIONS
+                          type: string
+                        maxItems: 16
+                        type: array
+                    type: object
+                  rateLimit:
+                    properties:
+                      action:
+                        enum:
+                        - block
+                        - captcha
+                        type: string
+                      burst:
+                        minimum: 0
+                        type: integer
+                      enabled:
+                        type: boolean
+                      key:
+                        enum:
+                        - clientIp
+                        type: string
+                      period:
+                        pattern: ^[0-9]+(ns|us|µs|ms|s|m|h)$
+                        type: string
+                      requests:
+                        minimum: 1
+                        type: integer
+                    type: object
+                  request:
+                    properties:
+                      maxBodySize:
+                        maxLength: 16
+                        pattern: ^[1-9][0-9]*[kKmMgG]?$
+                        type: string
+                    type: object
+                  urls:
+                    properties:
+                      block:
+                        items:
+                          properties:
+                            match:
+                              properties:
+                                path:
+                                  maxLength: 512
+                                  pattern: ^/[^\r\n\x00]*$
+                                  type: string
+                                type:
+                                  enum:
+                                  - glob
+                                  type: string
+                              required:
+                              - path
+                              - type
+                              type: object
+                            name:
+                              maxLength: 63
+                              type: string
+                          required:
+                          - match
+                          - name
+                          type: object
+                        maxItems: 100
+                        type: array
+                    type: object
+                type: object
             required:
             - domains
             - origins
@@ -335,6 +573,45 @@ spec:
                   - reason
                   type: object
                 type: array
+              secondarySync:
+                items:
+                  properties:
+                    desiredHash:
+                      type: string
+                    lastAttemptTime:
+                      format: date-time
+                      type: string
+                    lastError:
+                      type: string
+                    lastSuccessTime:
+                      format: date-time
+                      type: string
+                    latencySeconds:
+                      type: string
+                    name:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      type: integer
+                    status:
+                      enum:
+                      - synced
+                      - syncing
+                      - failed
+                      - unknown
+                      type: string
+                    syncedHash:
+                      type: string
+                    url:
+                      type: string
+                  required:
+                  - name
+                  - status
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
             type: object
         required:
         - spec
@@ -473,14 +750,7 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - events
-  verbs:
-  - create
-  - patch
-  - update
-- apiGroups:
-  - ""
-  resources:
+  - configmaps
   - namespaces
   - services
   verbs:
@@ -491,6 +761,14 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+  - update
 - apiGroups:
   - ""
   resources:
