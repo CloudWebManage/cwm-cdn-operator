@@ -792,6 +792,7 @@ rules:
   resources:
   - cdntenants/finalizers
   verbs:
+  - patch
   - update
 - apiGroups:
   - cdn.cloudwm-cdn.com
