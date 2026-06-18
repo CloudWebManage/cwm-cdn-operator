@@ -373,8 +373,9 @@ type CaptchaConfig struct {
 	// +optional
 	SiteKey string `json:"siteKey,omitempty"`
 
+	// Secret is the captcha provider server-side secret.
 	// +optional
-	SecretRef *LocalSecretKeyRef `json:"secretRef,omitempty"`
+	Secret string `json:"secret,omitempty"`
 
 	// +kubebuilder:validation:Pattern=`^[0-9]+(s|m|h|d)$`
 	// +optional
@@ -383,14 +384,6 @@ type CaptchaConfig struct {
 	// +kubebuilder:validation:MaxItems=100
 	// +optional
 	Rules []NamedPathRule `json:"rules,omitempty"`
-}
-
-type LocalSecretKeyRef struct {
-	// +required
-	Name string `json:"name"`
-
-	// +required
-	Key string `json:"key"`
 }
 
 type RedirectRule struct {

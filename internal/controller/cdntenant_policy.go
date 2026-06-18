@@ -29,7 +29,6 @@ const (
 	policyConfigMapKey        = "policy.json"
 	policyMountPath           = "/etc/cwm-cdn"
 	policyFilePath            = policyMountPath + "/" + policyConfigMapKey
-	captchaSecretMountPath    = "/etc/cwm-cdn/captcha-secret"
 	signingKeySecretName      = "tenant-policy-signing-key"
 	signingKeySecretKey       = "signing-key"
 	signingKeySecretMountPath = "/etc/cwm-cdn/signing-key"
@@ -134,6 +133,7 @@ func protectedTenantConfigEnvNames() map[string]struct{} {
 		"CWM_CDN_POLICY_PATH":                {},
 		"TENANT_POLICY_JSON":                 {},
 		"CAPTCHA_SECRET_PATH":                {},
+		"CAPTCHA_SECRET":                     {},
 		"CAPTCHA_SIGNING_KEY_PATH":           {},
 		"POP_ID":                             {},
 		"CWM_CDN_POP_ID":                     {},
@@ -264,10 +264,8 @@ func validateTenantPolicy(ctx context.Context, c client.Client, tenant *cdnv1.Cd
 			if captcha.SiteKey == "" {
 				errs = append(errs, "captcha.siteKey is required when captcha is enabled")
 			}
-			if captcha.SecretRef == nil || captcha.SecretRef.Name == "" || captcha.SecretRef.Key == "" {
-				errs = append(errs, "captcha.secretRef.name and captcha.secretRef.key are required when captcha is enabled")
-			} else if err := secretKeyExists(ctx, c, tenant.Name, captcha.SecretRef.Name, captcha.SecretRef.Key); err != nil {
-				errs = append(errs, fmt.Sprintf("captcha.secretRef is not ready: %v", err))
+			if captcha.Secret == "" {
+				errs = append(errs, "captcha.secret is required when captcha is enabled")
 			}
 			if captcha.CookieTtl != "" {
 				if _, err := parsePolicyDurationSeconds(captcha.CookieTtl, 1, 24*60*60); err != nil {
@@ -519,17 +517,6 @@ func validateHTTPStatuses(field string, statuses []cdnv1.HTTPStatusCode) []strin
 		seen[status] = struct{}{}
 	}
 	return errs
-}
-
-func secretKeyExists(ctx context.Context, c client.Client, namespace, name, key string) error {
-	secret := &corev1.Secret{}
-	if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, secret); err != nil {
-		return err
-	}
-	if _, ok := secret.Data[key]; !ok {
-		return fmt.Errorf("key %q not found in Secret %s/%s", key, namespace, name)
-	}
-	return nil
 }
 
 func secretRolloutHash(ctx context.Context, c client.Client, namespace, name, key string) (string, error) {

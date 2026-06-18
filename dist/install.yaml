@@ -135,16 +135,9 @@ spec:
                       type: object
                     maxItems: 100
                     type: array
-                  secretRef:
-                    properties:
-                      key:
-                        type: string
-                      name:
-                        type: string
-                    required:
-                    - key
-                    - name
-                    type: object
+                  secret:
+                    description: Secret is the captcha provider server-side secret.
+                    type: string
                   siteKey:
                     type: string
                 type: object

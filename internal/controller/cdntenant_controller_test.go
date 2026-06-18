@@ -1342,7 +1342,7 @@ var _ = Describe("CdnTenant Controller", func() {
 			Expect(strings.Join(errs, "; ")).To(ContainSubstring("captcha.cookieTtl"))
 			Expect(strings.Join(errs, "; ")).To(ContainSubstring("captcha.provider must be turnstile"))
 			Expect(strings.Join(errs, "; ")).To(ContainSubstring("captcha.siteKey is required"))
-			Expect(strings.Join(errs, "; ")).To(ContainSubstring("captcha.secretRef.name and captcha.secretRef.key"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("captcha.secret is required"))
 			Expect(strings.Join(errs, "; ")).To(ContainSubstring("invalid HTTP status"))
 			Expect(strings.Join(errs, "; ")).To(ContainSubstring("requires at least one matcher"))
 			Expect(strings.Join(errs, "; ")).To(ContainSubstring("when.path.value is invalid"))
@@ -1362,24 +1362,20 @@ var _ = Describe("CdnTenant Controller", func() {
 			Expect(strings.Join(validateTenantPolicy(ctx, k8sClient, invalid303), "; ")).To(ContainSubstring("status must be one of"))
 		})
 
-		It("should mount captcha provider and signing-key secrets when captcha is enabled", func() {
+		It("should render captcha secret from CRD and mount signing-key secret when captcha is enabled", func() {
 			const resourceName = "tenant-captcha-policy"
 			typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
 			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: resourceName}})).To(Succeed())
-			Expect(k8sClient.Create(ctx, &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Name: "turnstile-secret", Namespace: resourceName},
-				Data:       map[string][]byte{"secret": []byte("provider-secret")},
-			})).To(Succeed())
 			resource := &cdnv1.CdnTenant{
 				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
 				Spec: cdnv1.CdnTenantSpec{
 					Domains: []cdnv1.Domain{{Name: "captcha.example.com", Cert: "cert", Key: "key"}},
 					Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
 					Captcha: &cdnv1.CaptchaConfig{
-						Enabled:   true,
-						Provider:  "turnstile",
-						SiteKey:   "site-key",
-						SecretRef: &cdnv1.LocalSecretKeyRef{Name: "turnstile-secret", Key: "secret"},
+						Enabled:  true,
+						Provider: "turnstile",
+						SiteKey:  "site-key",
+						Secret:   "provider-secret",
 					},
 				},
 			}
@@ -1395,7 +1391,7 @@ var _ = Describe("CdnTenant Controller", func() {
 			for _, env := range deploy.Spec.Template.Spec.Containers[0].Env {
 				envMap[env.Name] = env.Value
 			}
-			Expect(envMap).To(HaveKeyWithValue("CAPTCHA_SECRET_PATH", "/etc/cwm-cdn/captcha-secret/secret"))
+			Expect(envMap).NotTo(HaveKey("CAPTCHA_SECRET_PATH"))
 			Expect(envMap).To(HaveKeyWithValue("CAPTCHA_SIGNING_KEY_PATH", "/etc/cwm-cdn/signing-key/signing-key"))
 			volumeSecrets := map[string]string{}
 			for _, volume := range deploy.Spec.Template.Spec.Volumes {
@@ -1403,47 +1399,28 @@ var _ = Describe("CdnTenant Controller", func() {
 					volumeSecrets[volume.Name] = volume.Secret.SecretName
 				}
 			}
-			Expect(volumeSecrets).To(HaveKeyWithValue("captcha-secret", "turnstile-secret"))
+			Expect(volumeSecrets).NotTo(HaveKey("captcha-secret"))
+
+			policyConfigMap := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: policyConfigMapName}, policyConfigMap)).To(Succeed())
+			Expect(policyConfigMap.Data[policyConfigMapKey]).To(ContainSubstring(`"secret": "provider-secret"`))
 
 			signingKey := &corev1.Secret{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: signingKeySecretName}, signingKey)).To(Succeed())
 			Expect(signingKey.Data).To(HaveKey(signingKeySecretKey))
-			oldCaptchaHash := deploy.Spec.Template.Annotations["cdn.cloudwm-cdn.com/captcha-secret-rollout-hash"]
 			oldSigningHash := deploy.Spec.Template.Annotations["cdn.cloudwm-cdn.com/signing-key-rollout-hash"]
-			Expect(oldCaptchaHash).NotTo(BeEmpty())
+			Expect(deploy.Spec.Template.Annotations).NotTo(HaveKey("cdn.cloudwm-cdn.com/captcha-secret-rollout-hash"))
 			Expect(oldSigningHash).NotTo(BeEmpty())
 
-			providerSecret := &corev1.Secret{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: "turnstile-secret"}, providerSecret)).To(Succeed())
-			providerSecret.Data["secret"] = []byte("rotated-provider-secret")
-			Expect(k8sClient.Update(ctx, providerSecret)).To(Succeed())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			resource.Spec.Captcha.Secret = "rotated-provider-secret"
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: policyConfigMapName}, policyConfigMap)).To(Succeed())
+			Expect(policyConfigMap.Data[policyConfigMapKey]).To(ContainSubstring(`"secret": "rotated-provider-secret"`))
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: "tenant"}, deploy)).To(Succeed())
-			Expect(deploy.Spec.Template.Annotations["cdn.cloudwm-cdn.com/captcha-secret-rollout-hash"]).NotTo(Equal(oldCaptchaHash))
 			Expect(deploy.Spec.Template.Annotations["cdn.cloudwm-cdn.com/signing-key-rollout-hash"]).To(Equal(oldSigningHash))
-		})
-
-		It("should enqueue tenants when referenced captcha provider Secrets change", func() {
-			const resourceName = "tenant-captcha-watch"
-			resource := &cdnv1.CdnTenant{
-				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
-				Spec: cdnv1.CdnTenantSpec{
-					Domains: []cdnv1.Domain{{Name: "captcha-watch.example.com", Cert: "cert", Key: "key"}},
-					Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
-					Captcha: &cdnv1.CaptchaConfig{
-						Enabled:   true,
-						Provider:  "turnstile",
-						SiteKey:   "site-key",
-						SecretRef: &cdnv1.LocalSecretKeyRef{Name: "turnstile-secret", Key: "secret"},
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-			controllerReconciler := &CdnTenantReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: &record.FakeRecorder{}}
-
-			reqs := controllerReconciler.tenantRequestsForObject(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "turnstile-secret", Namespace: resourceName}})
-			Expect(reqs).To(ConsistOf(reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: resourceName}}))
 		})
 	})
 

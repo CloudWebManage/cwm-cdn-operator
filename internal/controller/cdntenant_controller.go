@@ -1075,13 +1075,6 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if err != nil {
 			return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonPolicyValidationFailed, "Failed to render tenant policy")
 		}
-		captchaSecretHash := ""
-		if tenant.Spec.Captcha != nil && tenant.Spec.Captcha.Enabled && tenant.Spec.Captcha.SecretRef != nil {
-			captchaSecretHash, err = secretRolloutHash(ctx, r.Client, tenant.Name, tenant.Spec.Captcha.SecretRef.Name, tenant.Spec.Captcha.SecretRef.Key)
-			if err != nil {
-				return r.handleReconcileError(ctx, req, tenant, err, cdnv1.ReasonPolicyValidationFailed, "Failed to calculate captcha Secret rollout hash")
-			}
-		}
 		signingKeyHash := ""
 		if captchaRequired(tenant) {
 			signingKeyHash, err = secretRolloutHash(ctx, r.Client, tenant.Name, signingKeySecretName, signingKeySecretKey)
@@ -1147,11 +1140,6 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				deployment.Spec.Template.Annotations = map[string]string{}
 			}
 			deployment.Spec.Template.Annotations["cdn.cloudwm-cdn.com/policy-hash"] = policyHash
-			if captchaSecretHash != "" {
-				deployment.Spec.Template.Annotations["cdn.cloudwm-cdn.com/captcha-secret-rollout-hash"] = captchaSecretHash
-			} else {
-				delete(deployment.Spec.Template.Annotations, "cdn.cloudwm-cdn.com/captcha-secret-rollout-hash")
-			}
 			if signingKeyHash != "" {
 				deployment.Spec.Template.Annotations["cdn.cloudwm-cdn.com/signing-key-rollout-hash"] = signingKeyHash
 			} else {
@@ -1198,9 +1186,6 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			enablePlatformLogs := tenantDefaultConfig("ENABLE_PLATFORM_LOGS", "")
 			if enablePlatformLogs != "" {
 				env = append(env, corev1.EnvVar{Name: "ENABLE_PLATFORM_LOGS", Value: enablePlatformLogs})
-			}
-			if tenant.Spec.Captcha != nil && tenant.Spec.Captcha.Enabled && tenant.Spec.Captcha.SecretRef != nil {
-				env = append(env, corev1.EnvVar{Name: "CAPTCHA_SECRET_PATH", Value: fmt.Sprintf("%s/%s", captchaSecretMountPath, tenant.Spec.Captcha.SecretRef.Key)})
 			}
 			if captchaRequired(tenant) {
 				env = append(env, corev1.EnvVar{Name: "CAPTCHA_SIGNING_KEY_PATH", Value: fmt.Sprintf("%s/%s", signingKeySecretMountPath, signingKeySecretKey)})
@@ -1314,15 +1299,6 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				},
 			}
 			volumeMounts := []corev1.VolumeMount{{Name: "tenant-policy", MountPath: policyMountPath, ReadOnly: true}}
-			if tenant.Spec.Captcha != nil && tenant.Spec.Captcha.Enabled && tenant.Spec.Captcha.SecretRef != nil {
-				volumes = append(volumes, corev1.Volume{
-					Name: "captcha-secret",
-					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-						SecretName: tenant.Spec.Captcha.SecretRef.Name,
-					}},
-				})
-				volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "captcha-secret", MountPath: captchaSecretMountPath, ReadOnly: true})
-			}
 			if captchaRequired(tenant) {
 				volumes = append(volumes, corev1.Volume{
 					Name: "captcha-signing-key",
@@ -1536,24 +1512,7 @@ func (r *CdnTenantReconciler) tenantRequestsForObject(ctx context.Context, obj c
 			},
 		}}
 	}
-	secret, ok := obj.(*corev1.Secret)
-	if !ok {
-		return nil
-	}
-	var list cdnv1.CdnTenantList
-	if err := r.List(ctx, &list); err != nil {
-		return nil
-	}
-	var reqs []reconcile.Request
-	for _, tenant := range list.Items {
-		if tenant.Name != secret.Namespace {
-			continue
-		}
-		if tenant.Spec.Captcha != nil && tenant.Spec.Captcha.Enabled && tenant.Spec.Captcha.SecretRef != nil && tenant.Spec.Captcha.SecretRef.Name == secret.Name {
-			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: tenant.Namespace, Name: tenant.Name}})
-		}
-	}
-	return reqs
+	return nil
 }
 
 func (r *CdnTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
