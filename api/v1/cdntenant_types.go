@@ -97,6 +97,9 @@ const (
 
 	// ReasonDomainTLSPending indicates one or more domain certificates are not ready.
 	ReasonDomainTLSPending = "DomainTLSPending"
+
+	// ReasonPolicyValidationFailed indicates the tenant policy failed validation.
+	ReasonPolicyValidationFailed = "PolicyValidationFailed"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -238,6 +241,202 @@ type CdnTenantAutoscalingStatus struct {
 	LastMessage     string `json:"lastMessage,omitempty"`
 }
 
+// CacheConfig defines tenant CDN cache behavior.
+type CacheConfig struct {
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// +kubebuilder:validation:Enum=cache_everything
+	// +optional
+	Mode string `json:"mode,omitempty"`
+
+	// +kubebuilder:validation:Pattern=`^[0-9]+(s|m|h|d)$`
+	// +optional
+	EdgeTtl string `json:"edgeTtl,omitempty"`
+
+	// +optional
+	RespectOriginCacheControl *bool `json:"respectOriginCacheControl,omitempty"`
+
+	// +optional
+	StatusHeader *string `json:"statusHeader,omitempty"`
+}
+
+// SecurityConfig defines safe, typed request security controls.
+type SecurityConfig struct {
+	// +optional
+	IPAccess *IPAccessConfig `json:"ipAccess,omitempty"`
+
+	// +optional
+	Methods *MethodsConfig `json:"methods,omitempty"`
+
+	// +optional
+	URLs *URLSecurityConfig `json:"urls,omitempty"`
+
+	// +optional
+	RateLimit *RateLimitConfig `json:"rateLimit,omitempty"`
+
+	// +optional
+	Request *RequestSecurityConfig `json:"request,omitempty"`
+}
+
+type IPAccessConfig struct {
+	// +kubebuilder:validation:MaxItems=100
+	// +optional
+	AllowCidrs []string `json:"allowCidrs,omitempty"`
+
+	// +kubebuilder:validation:MaxItems=100
+	// +optional
+	BlockCidrs []string `json:"blockCidrs,omitempty"`
+}
+
+// +kubebuilder:validation:Pattern=`^[A-Z]+$`
+type HTTPMethod string
+
+type MethodsConfig struct {
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	Allow []HTTPMethod `json:"allow,omitempty"`
+
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	Block []HTTPMethod `json:"block,omitempty"`
+}
+
+type URLSecurityConfig struct {
+	// +kubebuilder:validation:MaxItems=100
+	// +optional
+	Block []NamedPathRule `json:"block,omitempty"`
+}
+
+type NamedPathRule struct {
+	// +required
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name"`
+
+	// +required
+	Match PathMatch `json:"match"`
+}
+
+type PathMatch struct {
+	// +kubebuilder:validation:Enum=glob
+	// +required
+	Type string `json:"type"`
+
+	// +kubebuilder:validation:MaxLength=512
+	// +kubebuilder:validation:Pattern=`^/[A-Za-z0-9._~/%:@+*,=-]*$`
+	// +required
+	Path string `json:"path"`
+}
+
+type RateLimitConfig struct {
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	Requests int `json:"requests,omitempty"`
+
+	// +kubebuilder:validation:Pattern=`^[0-9]+(s|m|h|d)$`
+	// +optional
+	Period string `json:"period,omitempty"`
+
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Burst int `json:"burst,omitempty"`
+
+	// +kubebuilder:validation:Enum=clientIp
+	// +optional
+	Key string `json:"key,omitempty"`
+
+	// +kubebuilder:validation:Enum=block;captcha
+	// +optional
+	Action string `json:"action,omitempty"`
+}
+
+type RequestSecurityConfig struct {
+	// +kubebuilder:validation:MaxLength=16
+	// +kubebuilder:validation:Pattern=`^[1-9][0-9]*[kKmMgG]?$`
+	// +optional
+	MaxBodySize string `json:"maxBodySize,omitempty"`
+}
+
+// CaptchaConfig defines tenant captcha settings.
+// +kubebuilder:validation:XValidation:rule="!has(self.rules) || size(self.rules) == 0 || (has(self.enabled) && self.enabled)",message="captcha.rules require captcha.enabled=true"
+type CaptchaConfig struct {
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// +kubebuilder:validation:Enum=turnstile
+	// +optional
+	Provider string `json:"provider,omitempty"`
+
+	// +optional
+	SiteKey string `json:"siteKey,omitempty"`
+
+	// Secret is the captcha provider server-side secret.
+	// +optional
+	Secret string `json:"secret,omitempty"`
+
+	// +kubebuilder:validation:Pattern=`^[0-9]+(s|m|h|d)$`
+	// +optional
+	CookieTtl string `json:"cookieTtl,omitempty"`
+
+	// +kubebuilder:validation:MaxItems=100
+	// +optional
+	Rules []NamedPathRule `json:"rules,omitempty"`
+}
+
+type RedirectRule struct {
+	// +required
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name"`
+
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// +required
+	When RedirectWhen `json:"when"`
+
+	// +required
+	// +kubebuilder:validation:MaxLength=512
+	To string `json:"to"`
+
+	// +kubebuilder:validation:Enum=301;302;307;308
+	// +optional
+	Status int `json:"status,omitempty"`
+
+	// +optional
+	PreserveQuery *bool `json:"preserveQuery,omitempty"`
+}
+
+type RedirectWhen struct {
+	// +optional
+	Path *RedirectPathMatch `json:"path,omitempty"`
+
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	OriginStatus []HTTPStatusCode `json:"originStatus,omitempty"`
+
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	UpstreamStatus []HTTPStatusCode `json:"upstreamStatus,omitempty"`
+}
+
+// +kubebuilder:validation:Minimum=100
+// +kubebuilder:validation:Maximum=599
+type HTTPStatusCode int
+
+type RedirectPathMatch struct {
+	// +kubebuilder:validation:Enum=glob
+	// +required
+	Type string `json:"type"`
+
+	// +kubebuilder:validation:MaxLength=512
+	// +kubebuilder:validation:Pattern=`^/[A-Za-z0-9._~/%:@+*,=-]*$`
+	// +required
+	Value string `json:"value"`
+}
+
 // CdnTenantSpec defines the desired state of CdnTenant
 type CdnTenantSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
@@ -261,6 +460,19 @@ type CdnTenantSpec struct {
 	// +optional
 	// +kubebuilder:validation:XValidation:rule="!self.enabled || self.minReplicas <= self.maxReplicas",message="minReplicas must be less than or equal to maxReplicas when autoscaling is enabled"
 	Autoscaling *CdnTenantAutoscalingSpec `json:"autoscaling,omitempty"`
+
+	// +optional
+	Cache *CacheConfig `json:"cache,omitempty"`
+
+	// +optional
+	Security *SecurityConfig `json:"security,omitempty"`
+
+	// +optional
+	Captcha *CaptchaConfig `json:"captcha,omitempty"`
+
+	// +kubebuilder:validation:MaxItems=100
+	// +optional
+	Redirects []RedirectRule `json:"redirects,omitempty"`
 
 	Config map[string]string `json:"config,omitempty"`
 }
@@ -292,6 +504,11 @@ type CdnTenantStatus struct {
 
 	// +optional
 	DomainTLS []DomainTLSStatus `json:"domainTLS,omitempty"`
+
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	SecondarySync []SecondarySyncStatus `json:"secondarySync,omitempty"`
 }
 
 type DomainTLSStatus struct {
@@ -309,6 +526,39 @@ type DomainTLSStatus struct {
 
 	// +required
 	Message string `json:"message"`
+}
+
+type SecondarySyncStatus struct {
+	// +required
+	Name string `json:"name"`
+
+	// +optional
+	URL string `json:"url,omitempty"`
+
+	// +kubebuilder:validation:Enum=synced;syncing;failed;unknown
+	// +required
+	Status string `json:"status"`
+
+	// +optional
+	DesiredHash string `json:"desiredHash,omitempty"`
+
+	// +optional
+	SyncedHash string `json:"syncedHash,omitempty"`
+
+	// +optional
+	LastAttemptTime *metav1.Time `json:"lastAttemptTime,omitempty"`
+
+	// +optional
+	LastSuccessTime *metav1.Time `json:"lastSuccessTime,omitempty"`
+
+	// +optional
+	LastError string `json:"lastError,omitempty"`
+
+	// +optional
+	LatencySeconds string `json:"latencySeconds,omitempty"`
+
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
 // +kubebuilder:object:root=true

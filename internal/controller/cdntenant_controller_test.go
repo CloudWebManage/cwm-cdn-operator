@@ -18,8 +18,14 @@ package controller
 
 import (
 	"context"
+	stdjson "encoding/json"
+	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -44,6 +50,54 @@ type noMatchDeleteClient struct {
 
 func (c noMatchDeleteClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
 	return &meta.NoKindMatchError{GroupKind: scaledObjectGVK.GroupKind(), SearchedVersions: []string{scaledObjectGVK.Version}}
+}
+
+type beforeStatusUpdateClient struct {
+	client.Client
+	beforeStatusUpdate func(context.Context, client.Object) error
+}
+
+func (c beforeStatusUpdateClient) Status() client.SubResourceWriter {
+	return beforeStatusUpdateWriter{
+		SubResourceWriter:  c.Client.Status(),
+		beforeStatusUpdate: c.beforeStatusUpdate,
+	}
+}
+
+type beforeStatusUpdateWriter struct {
+	client.SubResourceWriter
+	beforeStatusUpdate func(context.Context, client.Object) error
+}
+
+func (w beforeStatusUpdateWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	if w.beforeStatusUpdate != nil {
+		if err := w.beforeStatusUpdate(ctx, obj); err != nil {
+			return err
+		}
+	}
+	return w.SubResourceWriter.Update(ctx, obj, opts...)
+}
+
+func updateTenantAnnotationOnce(baseClient client.Client, annotationValue string) func(context.Context, client.Object) error {
+	updated := false
+	return func(ctx context.Context, obj client.Object) error {
+		if updated {
+			return nil
+		}
+		if _, ok := obj.(*cdnv1.CdnTenant); !ok {
+			return nil
+		}
+		updated = true
+		latest := &cdnv1.CdnTenant{}
+		if err := baseClient.Get(ctx, types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}, latest); err != nil {
+			return err
+		}
+		if latest.Annotations == nil {
+			latest.Annotations = map[string]string{}
+		}
+		latest.Annotations["cdn.cloudwm-cdn.com/status-conflict-test"] = annotationValue
+		return baseClient.Update(ctx, latest)
+	}
 }
 
 var _ = Describe("CdnTenant Controller", func() {
@@ -207,6 +261,12 @@ var _ = Describe("CdnTenant Controller", func() {
 			}))
 			Expect(deploy.Spec.Template.Spec.Containers[0].Env).To(ConsistOf([]corev1.EnvVar{
 				{Name: "TENANT_NAME", Value: "tenant1"},
+				{Name: "CACHE_ENABLED", Value: "true"},
+				{Name: "CACHE_MODE", Value: "cache_everything"},
+				{Name: "CACHE_EDGE_TTL_SECONDS", Value: "3600"},
+				{Name: "CACHE_RESPECT_ORIGIN_CACHE_CONTROL", Value: "true"},
+				{Name: "CACHE_STATUS_HEADER", Value: "X-CWM-Cache-Status"},
+				{Name: "CWM_CDN_POLICY_PATH", Value: "/etc/cwm-cdn/policy.json"},
 				{Name: "D0_NAME", Value: "test.example.com"},
 				{Name: "D0_KEY", Value: "bbb"},
 				{Name: "D0_CERT", Value: "aaa"},
@@ -567,6 +627,55 @@ var _ = Describe("CdnTenant Controller", func() {
 		})
 	})
 
+	Context("When status updates race with tenant metadata updates", func() {
+		ctx := context.Background()
+
+		AfterEach(func() {
+			tenantList := &cdnv1.CdnTenantList{}
+			_ = k8sClient.List(ctx, tenantList)
+			for _, t := range tenantList.Items {
+				t.Finalizers = nil
+				_ = k8sClient.Update(ctx, &t)
+				_ = k8sClient.Delete(ctx, &t)
+			}
+		})
+
+		It("should retry a conflict during success condition updates", func() {
+			const resourceName = "tenant-condition-conflict"
+			typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
+			resource := &cdnv1.CdnTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
+				Spec: cdnv1.CdnTenantSpec{
+					Domains: []cdnv1.Domain{{Name: "condition-conflict.example.com", Cert: "cert", Key: "key"}},
+					Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			controllerReconciler := &CdnTenantReconciler{
+				Client: beforeStatusUpdateClient{
+					Client:             k8sClient,
+					beforeStatusUpdate: updateTenantAnnotationOnce(k8sClient, "success-conditions"),
+				},
+				Scheme:   k8sClient.Scheme(),
+				Recorder: &record.FakeRecorder{},
+			}
+			tenant := &cdnv1.CdnTenant{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, tenant)).To(Succeed())
+
+			err := controllerReconciler.setSuccessConditions(ctx, reconcile.Request{NamespacedName: typeNamespacedName}, tenant, true)
+			Expect(err).NotTo(HaveOccurred())
+
+			latest := &cdnv1.CdnTenant{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, latest)).To(Succeed())
+			Expect(latest.Annotations).To(HaveKeyWithValue("cdn.cloudwm-cdn.com/status-conflict-test", "success-conditions"))
+			readyCondition := meta.FindStatusCondition(latest.Status.Conditions, cdnv1.TypeReady)
+			Expect(readyCondition).NotTo(BeNil())
+			Expect(readyCondition.Status).To(Equal(metav1.ConditionTrue))
+			Expect(readyCondition.Reason).To(Equal(cdnv1.ReasonAllResourcesReady))
+		})
+	})
+
 	// ============================================
 	// Deletion and Finalizer Tests
 	// ============================================
@@ -649,6 +758,7 @@ var _ = Describe("CdnTenant Controller", func() {
 				_ = k8sClient.Update(ctx, &t)
 				_ = k8sClient.Delete(ctx, &t)
 			}
+			_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: configSecretName, Namespace: "default"}})
 		})
 
 		It("should use default image when not specified in config", func() {
@@ -995,6 +1105,322 @@ var _ = Describe("CdnTenant Controller", func() {
 			Expect(envMap).To(HaveKeyWithValue("ANOTHER_VAR", "another_value"))
 			Expect(envMap).NotTo(HaveKey("IMAGE"))
 			Expect(envMap).NotTo(HaveKey("REPLICAS"))
+		})
+	})
+
+	Context("When testing CDN cache and policy configuration", func() {
+		ctx := context.Background()
+
+		AfterEach(func() {
+			tenantList := &cdnv1.CdnTenantList{}
+			_ = k8sClient.List(ctx, tenantList)
+			for _, t := range tenantList.Items {
+				t.Finalizers = nil
+				_ = k8sClient.Update(ctx, &t)
+				_ = k8sClient.Delete(ctx, &t)
+			}
+			_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: configSecretName, Namespace: "default"}})
+		})
+
+		It("should calculate effective cache defaults", func() {
+			cache, err := effectiveCache(nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cache.Enabled).To(BeTrue())
+			Expect(cache.Mode).To(Equal("cache_everything"))
+			Expect(cache.EdgeTTLSeconds).To(Equal(int64(3600)))
+			Expect(cache.RespectOriginCacheControl).To(BeTrue())
+			Expect(cache.StatusHeader).To(Equal("X-CWM-Cache-Status"))
+		})
+
+		It("should reject unsafe cache status headers", func() {
+			header := "Set-Cookie"
+			_, err := effectiveCache(&cdnv1.CacheConfig{StatusHeader: &header})
+			Expect(err).To(HaveOccurred())
+			header = "X-CWMCDN-Cache-Enabled"
+			_, err = effectiveCache(&cdnv1.CacheConfig{StatusHeader: &header})
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should reject cache semantics that the cache layer cannot honor yet", func() {
+			_, err := effectiveCache(&cdnv1.CacheConfig{EdgeTtl: "5m"})
+			Expect(err).To(MatchError(ContainSubstring("dynamic TTL")))
+			respectOrigin := false
+			_, err = effectiveCache(&cdnv1.CacheConfig{RespectOriginCacheControl: &respectOrigin})
+			Expect(err).To(MatchError(ContainSubstring("origin-header override")))
+		})
+
+		It("should render typed cache env vars and policy file without loose config override", func() {
+			Expect(os.Setenv("CWM_CDN_TENANT_DEFAULT_ENABLE_PLATFORM_LOGS", "true")).To(Succeed())
+			Expect(os.Setenv("CWM_CDN_TENANT_DEFAULT_POP_ID", "pop-test")).To(Succeed())
+			defer os.Unsetenv("CWM_CDN_TENANT_DEFAULT_ENABLE_PLATFORM_LOGS")
+			defer os.Unsetenv("CWM_CDN_TENANT_DEFAULT_POP_ID")
+			const resourceName = "tenant-cache-policy"
+			typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
+			enabled := false
+			header := "X-Cache-Test"
+			resource := &cdnv1.CdnTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
+				Spec: cdnv1.CdnTenantSpec{
+					Domains: []cdnv1.Domain{{Name: "cache.example.com", Cert: "cert", Key: "key"}},
+					Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
+					Cache: &cdnv1.CacheConfig{
+						Enabled:      &enabled,
+						Mode:         "cache_everything",
+						StatusHeader: &header,
+					},
+					Config: map[string]string{
+						"CUSTOM_VAR": "custom_value",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			controllerReconciler := &CdnTenantReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: &record.FakeRecorder{}}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			deploy := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: "tenant"}, deploy)).To(Succeed())
+			envMap := map[string]string{}
+			for _, env := range deploy.Spec.Template.Spec.Containers[0].Env {
+				envMap[env.Name] = env.Value
+			}
+			Expect(envMap).To(HaveKeyWithValue("CACHE_ENABLED", "false"))
+			Expect(envMap).To(HaveKeyWithValue("CACHE_EDGE_TTL_SECONDS", "3600"))
+			Expect(envMap).To(HaveKeyWithValue("CACHE_RESPECT_ORIGIN_CACHE_CONTROL", "true"))
+			Expect(envMap).To(HaveKeyWithValue("CACHE_STATUS_HEADER", "X-Cache-Test"))
+			Expect(envMap).To(HaveKeyWithValue("CWM_CDN_POLICY_PATH", "/etc/cwm-cdn/policy.json"))
+			Expect(envMap).NotTo(HaveKey("TENANT_POLICY_JSON"))
+			Expect(envMap).NotTo(HaveKey("CWM_CDN_POP_ID"))
+			Expect(envMap).To(HaveKeyWithValue("ENABLE_PLATFORM_LOGS", "true"))
+			Expect(envMap).To(HaveKeyWithValue("ENABLE_TENANT_ACCESS_LOGS", "true"))
+			Expect(envMap).To(HaveKeyWithValue("POP_ID", "pop-test"))
+			Expect(envMap).To(HaveKeyWithValue("CUSTOM_VAR", "custom_value"))
+
+			policy := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: policyConfigMapName}, policy)).To(Succeed())
+			Expect(policy.Data[policyConfigMapKey]).To(ContainSubstring("\"edgeTtlSeconds\": 3600"))
+			Expect(deploy.Spec.Template.Annotations).To(HaveKey("cdn.cloudwm-cdn.com/policy-hash"))
+		})
+	})
+
+	Context("When testing CDN security and captcha policy", func() {
+		ctx := context.Background()
+
+		AfterEach(func() {
+			tenantList := &cdnv1.CdnTenantList{}
+			_ = k8sClient.List(ctx, tenantList)
+			for _, t := range tenantList.Items {
+				t.Finalizers = nil
+				_ = k8sClient.Update(ctx, &t)
+				_ = k8sClient.Delete(ctx, &t)
+			}
+			_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: configSecretName, Namespace: "default"}})
+		})
+
+		It("should fail closed and set conditions for controller policy validation failures", func() {
+			const resourceName = "tenant-invalid-policy"
+			typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
+			var body map[string]interface{}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer r.Body.Close()
+				payload, err := io.ReadAll(r.Body)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(stdjson.Unmarshal(payload, &body)).To(Succeed())
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+			existingReplicas := int32(1)
+			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: resourceName}})).To(Succeed())
+			Expect(k8sClient.Create(ctx, &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Name: "tenant", Namespace: resourceName},
+				Spec: appsv1.DeploymentSpec{
+					Replicas: &existingReplicas,
+					Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "tenant"}},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "tenant"}},
+						Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "nginx", Image: "old-image"}}},
+					},
+				},
+			})).To(Succeed())
+			scaledObject := newScaledObject(&cdnv1.CdnTenant{ObjectMeta: metav1.ObjectMeta{Name: resourceName}})
+			scaledObject.Object["spec"] = map[string]interface{}{
+				"scaleTargetRef": map[string]interface{}{"name": "tenant"},
+				"triggers":       []interface{}{},
+			}
+			Expect(k8sClient.Create(ctx, scaledObject)).To(Succeed())
+			resource := &cdnv1.CdnTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
+				Spec: cdnv1.CdnTenantSpec{
+					Domains:     []cdnv1.Domain{{Name: "invalid.example.com", Cert: "cert", Key: "key"}},
+					Origins:     []cdnv1.Origin{{Url: "http://origin.example.com"}},
+					Autoscaling: &cdnv1.CdnTenantAutoscalingSpec{Enabled: true, MinReplicas: 1, MaxReplicas: 5},
+					Redirects: []cdnv1.RedirectRule{{
+						Name: "self",
+						When: cdnv1.RedirectWhen{Path: &cdnv1.RedirectPathMatch{Type: "glob", Value: "/same"}},
+						To:   "/same",
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			secondaries := []byte(`{"secondary-a":{"url":"` + server.URL + `","user":"u","pass":"p"}}`)
+			Expect(k8sClient.Create(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: configSecretName, Namespace: "default"},
+				Data: map[string][]byte{
+					"primaryKey":       []byte("primary"),
+					"secondaries.json": secondaries,
+				},
+			})).To(Succeed())
+			controllerReconciler := &CdnTenantReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: &record.FakeRecorder{}}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			deploy := &appsv1.Deployment{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: "tenant"}, deploy)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(deploy.Spec.Replicas).NotTo(BeNil())
+			Expect(*deploy.Spec.Replicas).To(Equal(int32(0)))
+			Expect(deploy.Spec.Template.Annotations).To(HaveKey("cdn.cloudwm-cdn.com/invalid-policy-hash"))
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: scaledObjectName}, scaledObject)).To(MatchError(ContainSubstring("not found")))
+			Expect(body).To(HaveKey("redirects"))
+
+			tenant := &cdnv1.CdnTenant{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, tenant)).To(Succeed())
+			readyCondition := meta.FindStatusCondition(tenant.Status.Conditions, cdnv1.TypeReady)
+			Expect(readyCondition).NotTo(BeNil())
+			Expect(readyCondition.Reason).To(Equal(cdnv1.ReasonPolicyValidationFailed))
+		})
+
+		It("should reject incomplete typed security, captcha, redirect policy fields", func() {
+			manyRules := make([]cdnv1.NamedPathRule, maxPolicyRules+1)
+			for i := range manyRules {
+				manyRules[i] = cdnv1.NamedPathRule{Name: fmt.Sprintf("rule-%d", i), Match: cdnv1.PathMatch{Type: "glob", Path: fmt.Sprintf("/rule-%d", i)}}
+			}
+			resource := &cdnv1.CdnTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: "tenant-invalid-extra-policy", Namespace: "default"},
+				Spec: cdnv1.CdnTenantSpec{
+					Domains: []cdnv1.Domain{{Name: "invalid-extra.example.com", Cert: "cert", Key: "key"}},
+					Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
+					Security: &cdnv1.SecurityConfig{
+						Methods:   &cdnv1.MethodsConfig{Allow: []cdnv1.HTTPMethod{"GET", "GET1"}, Block: []cdnv1.HTTPMethod{"GET"}},
+						RateLimit: &cdnv1.RateLimitConfig{Enabled: true, Requests: 1, Period: "90m", Key: "clientIp", Action: "captcha"},
+						Request:   &cdnv1.RequestSecurityConfig{MaxBodySize: "2g"},
+						URLs:      &cdnv1.URLSecurityConfig{Block: append([]cdnv1.NamedPathRule{{Name: "encoded", Match: cdnv1.PathMatch{Type: "glob", Path: "/%2e%2e/admin"}}}, manyRules...)},
+					},
+					Captcha: &cdnv1.CaptchaConfig{Enabled: true, Provider: "bad", CookieTtl: "30x", Rules: []cdnv1.NamedPathRule{{Name: "protected", Match: cdnv1.PathMatch{Type: "glob", Path: "/protected/*"}}}},
+					Redirects: []cdnv1.RedirectRule{
+						{
+							Name: "bad-redirect",
+							When: cdnv1.RedirectWhen{
+								Path:           &cdnv1.RedirectPathMatch{Type: "glob", Value: "relative/*"},
+								OriginStatus:   []cdnv1.HTTPStatusCode{200, 200},
+								UpstreamStatus: []cdnv1.HTTPStatusCode{700},
+							},
+							To: "//evil.example.com",
+						},
+						{
+							Name: "missing-path",
+							To:   "/ok",
+						},
+						{
+							Name: "self",
+							When: cdnv1.RedirectWhen{Path: &cdnv1.RedirectPathMatch{Type: "glob", Value: "/same"}},
+							To:   "/same?x=1",
+						},
+					},
+				},
+			}
+			_, sizeErr := parseMaxBodySize("9223372036854775807g")
+			Expect(sizeErr).To(HaveOccurred())
+			errs := validateTenantPolicy(ctx, k8sClient, resource)
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("security.methods.allow contains invalid HTTP method"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("security.methods method"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("security.request.maxBodySize"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("security.urls.block may contain at most"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("encoded path traversal"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("captcha.cookieTtl"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("captcha.provider must be turnstile"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("captcha.siteKey is required"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("captcha.secret is required"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("invalid HTTP status"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("requires at least one matcher"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("when.path.value is invalid"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("to is invalid"))
+			Expect(strings.Join(errs, "; ")).To(ContainSubstring("direct self-redirects are not allowed"))
+
+			protectedConfig := &cdnv1.CdnTenant{Spec: cdnv1.CdnTenantSpec{Config: map[string]string{"POP_ID": "tenant-pop"}}}
+			Expect(strings.Join(validateTenantPolicy(ctx, k8sClient, protectedConfig), "; ")).To(ContainSubstring("platform-managed"))
+
+			ipResource := &cdnv1.CdnTenant{Spec: cdnv1.CdnTenantSpec{Security: &cdnv1.SecurityConfig{IPAccess: &cdnv1.IPAccessConfig{AllowCidrs: []string{"10.0.0.0/8"}}}}}
+			Expect(strings.Join(validateTenantPolicy(ctx, k8sClient, ipResource), "; ")).To(ContainSubstring("trusted client IP"))
+
+			captchaRateLimit := &cdnv1.CdnTenant{Spec: cdnv1.CdnTenantSpec{Security: &cdnv1.SecurityConfig{RateLimit: &cdnv1.RateLimitConfig{Enabled: true, Requests: 1, Period: "1m", Key: "clientIp", Action: "captcha"}}}}
+			Expect(strings.Join(validateTenantPolicy(ctx, k8sClient, captchaRateLimit), "; ")).To(ContainSubstring("security.rateLimit.action=captcha requires captcha.enabled=true"))
+
+			invalid303 := &cdnv1.CdnTenant{Spec: cdnv1.CdnTenantSpec{Redirects: []cdnv1.RedirectRule{{Name: "see-other", When: cdnv1.RedirectWhen{Path: &cdnv1.RedirectPathMatch{Type: "glob", Value: "/old"}}, To: "/new", Status: 303}}}}
+			Expect(strings.Join(validateTenantPolicy(ctx, k8sClient, invalid303), "; ")).To(ContainSubstring("status must be one of"))
+		})
+
+		It("should render captcha secret from CRD and mount signing-key secret when captcha is enabled", func() {
+			const resourceName = "tenant-captcha-policy"
+			typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
+			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: resourceName}})).To(Succeed())
+			resource := &cdnv1.CdnTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
+				Spec: cdnv1.CdnTenantSpec{
+					Domains: []cdnv1.Domain{{Name: "captcha.example.com", Cert: "cert", Key: "key"}},
+					Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
+					Captcha: &cdnv1.CaptchaConfig{
+						Enabled:  true,
+						Provider: "turnstile",
+						SiteKey:  "site-key",
+						Secret:   "provider-secret",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			controllerReconciler := &CdnTenantReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: &record.FakeRecorder{}}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			deploy := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: "tenant"}, deploy)).To(Succeed())
+			envMap := map[string]string{}
+			for _, env := range deploy.Spec.Template.Spec.Containers[0].Env {
+				envMap[env.Name] = env.Value
+			}
+			Expect(envMap).NotTo(HaveKey("CAPTCHA_SECRET_PATH"))
+			Expect(envMap).To(HaveKeyWithValue("CAPTCHA_SIGNING_KEY_PATH", "/etc/cwm-cdn/signing-key/signing-key"))
+			volumeSecrets := map[string]string{}
+			for _, volume := range deploy.Spec.Template.Spec.Volumes {
+				if volume.Secret != nil {
+					volumeSecrets[volume.Name] = volume.Secret.SecretName
+				}
+			}
+			Expect(volumeSecrets).NotTo(HaveKey("captcha-secret"))
+
+			policyConfigMap := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: policyConfigMapName}, policyConfigMap)).To(Succeed())
+			Expect(policyConfigMap.Data[policyConfigMapKey]).To(ContainSubstring(`"secret": "provider-secret"`))
+
+			signingKey := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: signingKeySecretName}, signingKey)).To(Succeed())
+			Expect(signingKey.Data).To(HaveKey(signingKeySecretKey))
+			oldSigningHash := deploy.Spec.Template.Annotations["cdn.cloudwm-cdn.com/signing-key-rollout-hash"]
+			Expect(deploy.Spec.Template.Annotations).NotTo(HaveKey("cdn.cloudwm-cdn.com/captcha-secret-rollout-hash"))
+			Expect(oldSigningHash).NotTo(BeEmpty())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			resource.Spec.Captcha.Secret = "rotated-provider-secret"
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: policyConfigMapName}, policyConfigMap)).To(Succeed())
+			Expect(policyConfigMap.Data[policyConfigMapKey]).To(ContainSubstring(`"secret": "rotated-provider-secret"`))
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceName, Name: "tenant"}, deploy)).To(Succeed())
+			Expect(deploy.Spec.Template.Annotations["cdn.cloudwm-cdn.com/signing-key-rollout-hash"]).To(Equal(oldSigningHash))
 		})
 	})
 
@@ -2007,6 +2433,164 @@ var _ = Describe("CdnTenant Controller", func() {
 			}, deploy)).To(Succeed())
 
 			Expect(deploy.Annotations).To(HaveKeyWithValue("cdn.cloudwm-cdn.com/tenant", "default/"+resourceName))
+		})
+	})
+
+	Context("When syncing secondaries", func() {
+		ctx := context.Background()
+
+		AfterEach(func() {
+			tenantList := &cdnv1.CdnTenantList{}
+			_ = k8sClient.List(ctx, tenantList)
+			for _, t := range tenantList.Items {
+				t.Finalizers = nil
+				_ = k8sClient.Update(ctx, &t)
+				_ = k8sClient.Delete(ctx, &t)
+			}
+			_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: configSecretName, Namespace: "default"}})
+		})
+
+		It("should include typed spec fields in secondary sync and update status", func() {
+			const resourceName = "tenant-secondary-status"
+			typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
+			var body map[string]interface{}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer r.Body.Close()
+				payload, err := io.ReadAll(r.Body)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(stdjson.Unmarshal(payload, &body)).To(Succeed())
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			cacheTTL := "1h"
+			resource := &cdnv1.CdnTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default", Annotations: map[string]string{}},
+				Spec: cdnv1.CdnTenantSpec{
+					Domains: []cdnv1.Domain{{Name: "secondary.example.com", Cert: "cert", Key: "key"}},
+					Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
+					Cache:   &cdnv1.CacheConfig{Mode: "cache_everything", EdgeTtl: cacheTTL},
+					Redirects: []cdnv1.RedirectRule{{
+						Name: "docs",
+						When: cdnv1.RedirectWhen{Path: &cdnv1.RedirectPathMatch{Type: "glob", Value: "/docs/*"}},
+						To:   "/new-docs/",
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			secondaries := []byte(`{"secondary-a":{"url":"` + server.URL + `","user":"u","pass":"p"}}`)
+			Expect(k8sClient.Create(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: configSecretName, Namespace: "default"},
+				Data: map[string][]byte{
+					"primaryKey":       []byte("primary"),
+					"secondaries.json": secondaries,
+				},
+			})).To(Succeed())
+
+			controllerReconciler := &CdnTenantReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: &record.FakeRecorder{}}
+			tenant := &cdnv1.CdnTenant{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, tenant)).To(Succeed())
+
+			requeueAfter, err := controllerReconciler.syncSecondaries(reconcile.Request{NamespacedName: typeNamespacedName}, ctx, tenant)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(requeueAfter).To(BeZero())
+			Expect(body).To(HaveKey("cache"))
+			Expect(body).To(HaveKey("redirects"))
+
+			updated := &cdnv1.CdnTenant{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.SecondarySync).To(HaveLen(1))
+			Expect(updated.Status.SecondarySync[0].Name).To(Equal("secondary-a"))
+			Expect(updated.Status.SecondarySync[0].Status).To(Equal("synced"))
+			Expect(updated.Status.SecondarySync[0].DesiredHash).NotTo(BeEmpty())
+			Expect(updated.Status.SecondarySync[0].SyncedHash).To(Equal(updated.Status.SecondarySync[0].DesiredHash))
+			Expect(updated.Status.SecondarySync[0].LatencySeconds).NotTo(BeEmpty())
+			lastSuccess := updated.Status.SecondarySync[0].LastSuccessTime
+			latencySeconds := updated.Status.SecondarySync[0].LatencySeconds
+			Expect(lastSuccess).NotTo(BeNil())
+			updated.Status.SecondarySync[0].LastError = "previous failure"
+			Expect(k8sClient.Status().Update(ctx, updated)).To(Succeed())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+
+			requeueAfter, err = controllerReconciler.syncSecondaries(reconcile.Request{NamespacedName: typeNamespacedName}, ctx, updated)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(requeueAfter).To(BeZero())
+			reconciledAgain := &cdnv1.CdnTenant{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, reconciledAgain)).To(Succeed())
+			Expect(reconciledAgain.Status.SecondarySync).To(HaveLen(1))
+			Expect(reconciledAgain.Status.SecondarySync[0].LastSuccessTime).To(Equal(lastSuccess))
+			Expect(reconciledAgain.Status.SecondarySync[0].LatencySeconds).To(Equal(latencySeconds))
+			Expect(reconciledAgain.Status.SecondarySync[0].LastError).To(BeEmpty())
+		})
+
+		It("should retry a conflict during secondary sync status updates", func() {
+			const resourceName = "tenant-secondary-status-conflict"
+			typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			resource := &cdnv1.CdnTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default", Annotations: map[string]string{}},
+				Spec: cdnv1.CdnTenantSpec{
+					Domains: []cdnv1.Domain{{Name: "secondary-conflict.example.com", Cert: "cert", Key: "key"}},
+					Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			secondaries := []byte(`{"secondary-a":{"url":"` + server.URL + `","user":"u","pass":"p"}}`)
+			Expect(k8sClient.Create(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: configSecretName, Namespace: "default"},
+				Data: map[string][]byte{
+					"primaryKey":       []byte("primary"),
+					"secondaries.json": secondaries,
+				},
+			})).To(Succeed())
+
+			controllerReconciler := &CdnTenantReconciler{
+				Client: beforeStatusUpdateClient{
+					Client:             k8sClient,
+					beforeStatusUpdate: updateTenantAnnotationOnce(k8sClient, "secondary-status"),
+				},
+				Scheme:   k8sClient.Scheme(),
+				Recorder: &record.FakeRecorder{},
+			}
+			tenant := &cdnv1.CdnTenant{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, tenant)).To(Succeed())
+
+			requeueAfter, err := controllerReconciler.syncSecondaries(reconcile.Request{NamespacedName: typeNamespacedName}, ctx, tenant)
+			Expect(requeueAfter).To(BeZero())
+			Expect(err).NotTo(HaveOccurred())
+
+			latest := &cdnv1.CdnTenant{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, latest)).To(Succeed())
+			Expect(latest.Annotations).To(HaveKeyWithValue("cdn.cloudwm-cdn.com/status-conflict-test", "secondary-status"))
+			Expect(latest.Annotations).To(HaveKeyWithValue("cdn.cloudwm-cdn.com/secondaries--secondary-a-status", "synced"))
+			Expect(latest.Status.SecondarySync).To(HaveLen(1))
+			Expect(latest.Status.SecondarySync[0].Name).To(Equal("secondary-a"))
+			Expect(latest.Status.SecondarySync[0].Status).To(Equal("synced"))
+			Expect(latest.Status.SecondarySync[0].SyncedHash).To(Equal(latest.Status.SecondarySync[0].DesiredHash))
+		})
+
+		It("should URL-escape primary keys when syncing deletes", func() {
+			const resourceName = "tenant-secondary-delete-query"
+			primaryKey := "a+b&c=d"
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				Expect(r.URL.Path).To(Equal("/delete"))
+				Expect(r.URL.Query().Get("cdn_tenant_name")).To(Equal(resourceName))
+				Expect(r.URL.Query().Get("primary_key")).To(Equal(primaryKey))
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			deletionTime := metav1.Now()
+			tenant := &cdnv1.CdnTenant{ObjectMeta: metav1.ObjectMeta{Name: resourceName, DeletionTimestamp: &deletionTime}}
+			controllerReconciler := &CdnTenantReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: &record.FakeRecorder{}}
+
+			requeue, err := controllerReconciler.syncSecondary(ctx, tenant, nil, "secondary-a", map[string]string{"url": server.URL, "user": "u", "pass": "p"}, primaryKey)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(requeue).To(BeFalse())
 		})
 	})
 
