@@ -51,6 +51,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -89,44 +90,92 @@ type CdnTenantReconciler struct {
 	Recorder record.EventRecorder
 }
 
+func copyTenantInto(dst *cdnv1.CdnTenant, src *cdnv1.CdnTenant) {
+	if dst != nil {
+		src.DeepCopyInto(dst)
+	}
+}
+
+func (r *CdnTenantReconciler) updateTenantStatus(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, mutate func(*cdnv1.CdnTenant)) error {
+	log := logf.FromContext(ctx)
+	expectedGeneration := tenant.Generation
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &cdnv1.CdnTenant{}
+		if err := r.Get(ctx, req.NamespacedName, latest); err != nil {
+			log.Error(err, "Failed to re-fetch tenant")
+			return err
+		}
+		if expectedGeneration != 0 && latest.Generation != expectedGeneration {
+			log.V(1).Info("Skipping stale tenant status update", "expectedGeneration", expectedGeneration, "currentGeneration", latest.Generation)
+			copyTenantInto(tenant, latest)
+			return nil
+		}
+
+		before := latest.DeepCopy()
+		mutate(latest)
+		if equality.Semantic.DeepEqual(before.Status, latest.Status) {
+			copyTenantInto(tenant, latest)
+			return nil
+		}
+		if err := r.Status().Update(ctx, latest); err != nil {
+			if !apierrors.IsConflict(err) {
+				log.Error(err, "Failed to update Tenant status")
+			}
+			return err
+		}
+		copyTenantInto(tenant, latest)
+		return nil
+	})
+}
+
+func (r *CdnTenantReconciler) patchTenantMetadata(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, mutate func(*cdnv1.CdnTenant)) error {
+	log := logf.FromContext(ctx)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &cdnv1.CdnTenant{}
+		if err := r.Get(ctx, req.NamespacedName, latest); err != nil {
+			log.Error(err, "Failed to re-fetch tenant")
+			return err
+		}
+
+		before := latest.DeepCopy()
+		mutate(latest)
+		if equality.Semantic.DeepEqual(before.Annotations, latest.Annotations) && equality.Semantic.DeepEqual(before.Finalizers, latest.Finalizers) {
+			copyTenantInto(tenant, latest)
+			return nil
+		}
+		if err := r.Patch(ctx, latest, client.MergeFrom(before)); err != nil {
+			if !apierrors.IsConflict(err) {
+				log.Error(err, "Failed to patch Tenant metadata")
+			}
+			return err
+		}
+		copyTenantInto(tenant, latest)
+		return nil
+	})
+}
+
 // setCondition sets a condition on the tenant status and updates it in the API server.
 func (r *CdnTenantReconciler) setCondition(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, conditionType string, status metav1.ConditionStatus, reason, message string) error {
-	// Re-fetch the tenant first to get the latest version
-	if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
-		logf.FromContext(ctx).Error(err, "Failed to re-fetch tenant")
-		return err
-	}
-	meta.SetStatusCondition(&tenant.Status.Conditions, metav1.Condition{
-		Type:               conditionType,
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		ObservedGeneration: tenant.Generation,
+	return r.updateTenantStatus(ctx, req, tenant, func(latest *cdnv1.CdnTenant) {
+		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+			Type:               conditionType,
+			Status:             status,
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: latest.Generation,
+		})
 	})
-	if err := r.Status().Update(ctx, tenant); err != nil {
-		logf.FromContext(ctx).Error(err, "Failed to update Tenant status")
-		return err
-	}
-	return nil
 }
 
 // setConditions sets multiple conditions on the tenant status and updates it in the API server.
 func (r *CdnTenantReconciler) setConditions(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, conditions []metav1.Condition) error {
 	logf.FromContext(ctx).V(1).Info("Setting conditions", "conditions", conditions)
-	// Re-fetch the tenant first to get the latest version
-	if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
-		logf.FromContext(ctx).Error(err, "Failed to re-fetch tenant")
-		return err
-	}
-	for _, cond := range conditions {
-		cond.ObservedGeneration = tenant.Generation
-		meta.SetStatusCondition(&tenant.Status.Conditions, cond)
-	}
-	if err := r.Status().Update(ctx, tenant); err != nil {
-		logf.FromContext(ctx).Error(err, "Failed to update Tenant status")
-		return err
-	}
-	return nil
+	return r.updateTenantStatus(ctx, req, tenant, func(latest *cdnv1.CdnTenant) {
+		for _, cond := range conditions {
+			cond.ObservedGeneration = latest.Generation
+			meta.SetStatusCondition(&latest.Status.Conditions, cond)
+		}
+	})
 }
 
 // setProgressingCondition sets the Progressing condition to indicate reconciliation is in progress.
@@ -581,25 +630,15 @@ func (r *CdnTenantReconciler) reconcileDomainTLSResources(ctx context.Context, t
 }
 
 func (r *CdnTenantReconciler) updateDomainTLSStatus(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, statuses []cdnv1.DomainTLSStatus) error {
-	if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
-		return err
-	}
-	if equality.Semantic.DeepEqual(tenant.Status.DomainTLS, statuses) {
-		return nil
-	}
-	tenant.Status.DomainTLS = statuses
-	return r.Status().Update(ctx, tenant)
+	return r.updateTenantStatus(ctx, req, tenant, func(latest *cdnv1.CdnTenant) {
+		latest.Status.DomainTLS = statuses
+	})
 }
 
 func (r *CdnTenantReconciler) updateSecondarySyncStatus(ctx context.Context, req ctrl.Request, tenant *cdnv1.CdnTenant, statuses []cdnv1.SecondarySyncStatus) error {
-	if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
-		return err
-	}
-	if equality.Semantic.DeepEqual(tenant.Status.SecondarySync, statuses) {
-		return nil
-	}
-	tenant.Status.SecondarySync = statuses
-	return r.Status().Update(ctx, tenant)
+	return r.updateTenantStatus(ctx, req, tenant, func(latest *cdnv1.CdnTenant) {
+		latest.Status.SecondarySync = statuses
+	})
 }
 
 func cloneTenantSpec(spec cdnv1.CdnTenantSpec) (cdnv1.CdnTenantSpec, error) {
@@ -899,14 +938,9 @@ func (r *CdnTenantReconciler) updateAutoscalingStatus(ctx context.Context, req c
 		status.LastMessage = "Autoscaling disabled; fixed replicas are controlled by spec.config.REPLICAS"
 	}
 
-	if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
-		return err
-	}
-	if equality.Semantic.DeepEqual(tenant.Status.Autoscaling, status) {
-		return nil
-	}
-	tenant.Status.Autoscaling = status
-	return r.Status().Update(ctx, tenant)
+	return r.updateTenantStatus(ctx, req, tenant, func(latest *cdnv1.CdnTenant) {
+		latest.Status.Autoscaling = status
+	})
 }
 
 func originHealthEnvVars(index int, healthCheck *cdnv1.OriginHealthCheck) []corev1.EnvVar {
@@ -941,7 +975,7 @@ func originHealthEnvVars(index int, healthCheck *cdnv1.OriginHealthCheck) []core
 
 // +kubebuilder:rbac:groups=cdn.cloudwm-cdn.com,resources=cdntenants,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cdn.cloudwm-cdn.com,resources=cdntenants/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=cdn.cloudwm-cdn.com,resources=cdntenants/finalizers,verbs=update
+// +kubebuilder:rbac:groups=cdn.cloudwm-cdn.com,resources=cdntenants/finalizers,verbs=patch;update
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;update
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
@@ -985,8 +1019,9 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if !controllerutil.ContainsFinalizer(tenant, tenantFinalizer) {
 			log.V(1).Info("Adding finalizer")
 			hasUpdates = true
-			controllerutil.AddFinalizer(tenant, tenantFinalizer)
-			if err := r.Update(ctx, tenant); err != nil {
+			if err := r.patchTenantMetadata(ctx, req, tenant, func(latest *cdnv1.CdnTenant) {
+				controllerutil.AddFinalizer(latest, tenantFinalizer)
+			}); err != nil {
 				log.Error(err, "Failed to add finalizer to tenant")
 				return ctrl.Result{}, err
 			}
@@ -1433,17 +1468,15 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 		readyCondition := meta.FindStatusCondition(tenant.Status.Conditions, cdnv1.TypeReady)
 		needsConditionUpdate := hasUpdates || readyCondition == nil || readyCondition.Status != metav1.ConditionTrue
+		readyConditionStatus := "nil"
+		if readyCondition != nil {
+			readyConditionStatus = string(readyCondition.Status)
+		}
 		log.V(1).Info(
 			"Reconciliation complete",
 			"needsConditionUpdate", needsConditionUpdate,
 			"hasUpdates", hasUpdates,
-			"readyConditionStatus", func() string {
-				if readyCondition == nil {
-					return "nil"
-				} else {
-					return string(readyCondition.Status)
-				}
-			},
+			"readyConditionStatus", readyConditionStatus,
 		)
 		if needsConditionUpdate {
 			if err := r.setSuccessConditions(ctx, req, tenant, true); err != nil {
@@ -1475,8 +1508,9 @@ func (r *CdnTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 		log.V(1).Info("Reconciled Secondaries for deletion")
 		if controllerutil.ContainsFinalizer(tenant, tenantFinalizer) {
-			controllerutil.RemoveFinalizer(tenant, tenantFinalizer)
-			if err := r.Update(ctx, tenant); err != nil {
+			if err := r.patchTenantMetadata(ctx, req, tenant, func(latest *cdnv1.CdnTenant) {
+				controllerutil.RemoveFinalizer(latest, tenantFinalizer)
+			}); err != nil {
 				log.Error(err, "Failed to remove finalizer from tenant")
 				return ctrl.Result{}, err
 			}
@@ -1736,17 +1770,14 @@ func (r *CdnTenantReconciler) syncSecondariesSpec(req ctrl.Request, ctx context.
 		statuses = append(statuses, secondaryStatus)
 	}
 	if len(updateTenantAnnotations) > 0 {
-		if err := r.Get(ctx, req.NamespacedName, tenant); err != nil {
-			log.Error(err, "Failed to re-fetch tenant")
-			return 0, err
-		}
-		if tenant.Annotations == nil {
-			tenant.Annotations = map[string]string{}
-		}
-		for k, v := range updateTenantAnnotations {
-			tenant.Annotations[k] = v
-		}
-		if err := r.Update(ctx, tenant); err != nil {
+		if err := r.patchTenantMetadata(ctx, req, tenant, func(latest *cdnv1.CdnTenant) {
+			if latest.Annotations == nil {
+				latest.Annotations = map[string]string{}
+			}
+			for k, v := range updateTenantAnnotations {
+				latest.Annotations[k] = v
+			}
+		}); err != nil {
 			return 0, err
 		}
 	}

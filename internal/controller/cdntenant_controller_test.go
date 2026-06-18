@@ -52,6 +52,54 @@ func (c noMatchDeleteClient) Delete(ctx context.Context, obj client.Object, opts
 	return &meta.NoKindMatchError{GroupKind: scaledObjectGVK.GroupKind(), SearchedVersions: []string{scaledObjectGVK.Version}}
 }
 
+type beforeStatusUpdateClient struct {
+	client.Client
+	beforeStatusUpdate func(context.Context, client.Object) error
+}
+
+func (c beforeStatusUpdateClient) Status() client.SubResourceWriter {
+	return beforeStatusUpdateWriter{
+		SubResourceWriter:  c.Client.Status(),
+		beforeStatusUpdate: c.beforeStatusUpdate,
+	}
+}
+
+type beforeStatusUpdateWriter struct {
+	client.SubResourceWriter
+	beforeStatusUpdate func(context.Context, client.Object) error
+}
+
+func (w beforeStatusUpdateWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	if w.beforeStatusUpdate != nil {
+		if err := w.beforeStatusUpdate(ctx, obj); err != nil {
+			return err
+		}
+	}
+	return w.SubResourceWriter.Update(ctx, obj, opts...)
+}
+
+func updateTenantAnnotationOnce(baseClient client.Client, annotationValue string) func(context.Context, client.Object) error {
+	updated := false
+	return func(ctx context.Context, obj client.Object) error {
+		if updated {
+			return nil
+		}
+		if _, ok := obj.(*cdnv1.CdnTenant); !ok {
+			return nil
+		}
+		updated = true
+		latest := &cdnv1.CdnTenant{}
+		if err := baseClient.Get(ctx, types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}, latest); err != nil {
+			return err
+		}
+		if latest.Annotations == nil {
+			latest.Annotations = map[string]string{}
+		}
+		latest.Annotations["cdn.cloudwm-cdn.com/status-conflict-test"] = annotationValue
+		return baseClient.Update(ctx, latest)
+	}
+}
+
 var _ = Describe("CdnTenant Controller", func() {
 	Context("When deriving domain TLS configuration", func() {
 		It("should default existing domains to provided TLS without redirect", func() {
@@ -576,6 +624,55 @@ var _ = Describe("CdnTenant Controller", func() {
 
 			deploy.Status.ReadyReplicas = 4
 			Expect(isDeploymentReady(deploy)).To(BeTrue())
+		})
+	})
+
+	Context("When status updates race with tenant metadata updates", func() {
+		ctx := context.Background()
+
+		AfterEach(func() {
+			tenantList := &cdnv1.CdnTenantList{}
+			_ = k8sClient.List(ctx, tenantList)
+			for _, t := range tenantList.Items {
+				t.Finalizers = nil
+				_ = k8sClient.Update(ctx, &t)
+				_ = k8sClient.Delete(ctx, &t)
+			}
+		})
+
+		It("should retry a conflict during success condition updates", func() {
+			const resourceName = "tenant-condition-conflict"
+			typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
+			resource := &cdnv1.CdnTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
+				Spec: cdnv1.CdnTenantSpec{
+					Domains: []cdnv1.Domain{{Name: "condition-conflict.example.com", Cert: "cert", Key: "key"}},
+					Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			controllerReconciler := &CdnTenantReconciler{
+				Client: beforeStatusUpdateClient{
+					Client:             k8sClient,
+					beforeStatusUpdate: updateTenantAnnotationOnce(k8sClient, "success-conditions"),
+				},
+				Scheme:   k8sClient.Scheme(),
+				Recorder: &record.FakeRecorder{},
+			}
+			tenant := &cdnv1.CdnTenant{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, tenant)).To(Succeed())
+
+			err := controllerReconciler.setSuccessConditions(ctx, reconcile.Request{NamespacedName: typeNamespacedName}, tenant, true)
+			Expect(err).NotTo(HaveOccurred())
+
+			latest := &cdnv1.CdnTenant{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, latest)).To(Succeed())
+			Expect(latest.Annotations).To(HaveKeyWithValue("cdn.cloudwm-cdn.com/status-conflict-test", "success-conditions"))
+			readyCondition := meta.FindStatusCondition(latest.Status.Conditions, cdnv1.TypeReady)
+			Expect(readyCondition).NotTo(BeNil())
+			Expect(readyCondition.Status).To(Equal(metav1.ConditionTrue))
+			Expect(readyCondition.Reason).To(Equal(cdnv1.ReasonAllResourcesReady))
 		})
 	})
 
@@ -2447,6 +2544,56 @@ var _ = Describe("CdnTenant Controller", func() {
 			Expect(reconciledAgain.Status.SecondarySync[0].LastSuccessTime).To(Equal(lastSuccess))
 			Expect(reconciledAgain.Status.SecondarySync[0].LatencySeconds).To(Equal(latencySeconds))
 			Expect(reconciledAgain.Status.SecondarySync[0].LastError).To(BeEmpty())
+		})
+
+		It("should retry a conflict during secondary sync status updates", func() {
+			const resourceName = "tenant-secondary-status-conflict"
+			typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			resource := &cdnv1.CdnTenant{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default", Annotations: map[string]string{}},
+				Spec: cdnv1.CdnTenantSpec{
+					Domains: []cdnv1.Domain{{Name: "secondary-conflict.example.com", Cert: "cert", Key: "key"}},
+					Origins: []cdnv1.Origin{{Url: "http://origin.example.com"}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			secondaries := []byte(`{"secondary-a":{"url":"` + server.URL + `","user":"u","pass":"p"}}`)
+			Expect(k8sClient.Create(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: configSecretName, Namespace: "default"},
+				Data: map[string][]byte{
+					"primaryKey":       []byte("primary"),
+					"secondaries.json": secondaries,
+				},
+			})).To(Succeed())
+
+			controllerReconciler := &CdnTenantReconciler{
+				Client: beforeStatusUpdateClient{
+					Client:             k8sClient,
+					beforeStatusUpdate: updateTenantAnnotationOnce(k8sClient, "secondary-status"),
+				},
+				Scheme:   k8sClient.Scheme(),
+				Recorder: &record.FakeRecorder{},
+			}
+			tenant := &cdnv1.CdnTenant{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, tenant)).To(Succeed())
+
+			requeueAfter, err := controllerReconciler.syncSecondaries(reconcile.Request{NamespacedName: typeNamespacedName}, ctx, tenant)
+			Expect(requeueAfter).To(BeZero())
+			Expect(err).NotTo(HaveOccurred())
+
+			latest := &cdnv1.CdnTenant{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, latest)).To(Succeed())
+			Expect(latest.Annotations).To(HaveKeyWithValue("cdn.cloudwm-cdn.com/status-conflict-test", "secondary-status"))
+			Expect(latest.Annotations).To(HaveKeyWithValue("cdn.cloudwm-cdn.com/secondaries--secondary-a-status", "synced"))
+			Expect(latest.Status.SecondarySync).To(HaveLen(1))
+			Expect(latest.Status.SecondarySync[0].Name).To(Equal("secondary-a"))
+			Expect(latest.Status.SecondarySync[0].Status).To(Equal("synced"))
+			Expect(latest.Status.SecondarySync[0].SyncedHash).To(Equal(latest.Status.SecondarySync[0].DesiredHash))
 		})
 
 		It("should URL-escape primary keys when syncing deletes", func() {
